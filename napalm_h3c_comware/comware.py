@@ -1,9 +1,21 @@
+import logging
 from collections import defaultdict
 from operator import itemgetter
-from typing import Any, Dict, List, Optional, TypedDict, Union
+from typing import (
+    Any,
+    Dict,
+    List,
+    Literal,
+    NewType,
+    Optional,
+    TypeAlias,
+    TypedDict,
+    Union,
+)
 
 from napalm.base import models
 from napalm.base.base import NetworkDriver
+from napalm.base.exceptions import CommandErrorException
 from napalm.base.helpers import (
     mac,
     textfsm_extractor,
@@ -18,6 +30,26 @@ from .utils.helpers import (
     parse_time,
     strptime,
 )
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+
+
+VersionInfo: TypeAlias = Dict[str, Union[str, int]]
+
+
+MACAddress = NewType("MACAddress", str)
+SerialNumber = NewType("SerialNumber", str)
+
+
+class DeviceManuinfoItem(TypedDict):
+    chassis_id: str
+    slot_type: Literal["Slot", "Fan", "Power"]
+    slot_id: str
+    device_name: Optional[str]
+    serial_number: Optional[SerialNumber]
+    manufacturing_date: Optional[str]
+    vendor_name: Optional[str]
+    mac_address: Optional[MACAddress]
 
 
 class MacMoveEntry(TypedDict):
@@ -61,10 +93,11 @@ class ComwareDriver(NetworkDriver):
         return self.device.send_command(command, *args, **kwargs)
 
     def is_alive(self) -> models.AliveDict:
-        if self.device is None:
+        try:
+            return {"is_alive": False if self.device is None else getattr(self.device, "is_alive", lambda: False)()}
+        except Exception as e:
+            logging.warning(f"Device alive check failed: {str(e)}")
             return {"is_alive": False}
-        else:
-            return {"is_alive": self.device.is_alive()}
 
     def _get_structured_output(self, command: str, template_name: Optional[str] = None):
         if template_name is None:
@@ -73,73 +106,129 @@ class ComwareDriver(NetworkDriver):
         result = textfsm_extractor(self, template_name, raw_output)  # type: ignore
         return result
 
-    def get_facts(self):
-        vendor = "Comware"
-        uptime = -1
-        serial_number, fqdn, os_version, hostname, fqdn = ("Unknown",) * 5
+    def get_facts(self) -> models.FactsDict:
+        """
+        Returns a dictionary containing the following information:
+         * uptime - Uptime of the device in seconds.
+         * vendor - Manufacturer of the device.
+         * model - Device model.
+         * hostname - Hostname of the device
+         * fqdn - Fqdn of the device
+         * os_version - String with the OS version running on the device.
+         * serial_number - Serial number of the device
+         * interface_list - List of the interfaces of the device
 
-        # uptime、vender、model
-        cmd_sys_info = "display version"
-        structured_sys_info = self._get_structured_output(cmd_sys_info)
-        print("structured_sys_info", structured_sys_info)
-        if isinstance(structured_sys_info, list) and len(structured_sys_info) == 1:
-            structured_sys_info = structured_sys_info[0]
-            (uptime_str, vendor, model, os_version) = itemgetter("uptime", "vendor", "model", "os_version")(
-                structured_sys_info
-            )
-            uptime = parse_time(uptime_str)
+        Example::
 
-        # os_version. format: `Version.Patch`.
-        # Example: "Release 2612P01.2612P01H03"
-        # cmd_os_version = "display device"
-        # structured_os_version = self._get_structured_output(cmd_os_version)
+            {
+            'uptime': 151005.57332897186,
+            'vendor': u'Arista',
+            'os_version': u'4.14.3-2329074.gaatlantarel',
+            'serial_number': u'SN0123A34AS',
+            'model': u'vEOS',
+            'hostname': u'eos-router',
+            'fqdn': u'eos-router',
+            'interface_list': [u'Ethernet2', u'Management1', u'Ethernet1', u'Ethernet3']
+            }
 
-        # fqdn
-        # show_domain = self.send_command("display dns domain")
+        """
 
-        # hostname
-        hostname = self.device.find_prompt()[1:-1]
+        def _safe_get(data: Optional[Dict], key: str, default: Union[str, float] = "") -> Union[str, float]:
+            """Safe dictionary value extraction with type preservation."""
+            if not data or key not in data:
+                return default
+            return data[key] if data[key] is not None else default
 
-        # interfaces
-        interface_list = []
-        structured_int_info = self._get_structured_output("display interface")
-        for interface in structured_int_info:
-            interface_list.append(interface.get("interface"))
+        try:
+            version = self._get_version() or {}
+            hostname = self.device.find_prompt()[1:-1]
+            manuinfo = self._get_device_manuinfo() or []
+            interfaces = self.get_interfaces() or {}
+        except Exception as e:
+            raise ValueError(f"Data collection failed: {str(e)}") from e
 
-        # serial number
-        cmd_sn = "display device manuinfo"
-        structured_sn = self._get_structured_output(cmd_sn)
-        if isinstance(structured_sn, list) and len(structured_sn) > 0:
-            serial_number = []
-            chassis_list = []
-            slot_list = []
-            for sn in structured_sn:
-                if sn.get("slot_type") == "Chassis":
-                    chassis_sn = sn.get("serial_number")
-                    if chassis_sn != "":
-                        chassis_list.append(chassis_sn)
-                if sn.get("slot_type") == "Slot":
-                    slot_sn = sn.get("serial_number")
-                    if slot_sn != "":
-                        slot_list.append(slot_sn)
+        serials = []
+        for item in manuinfo:
+            if isinstance(item, dict) and "serial_number" in item:
+                sn = str(item["serial_number"]).strip()
+                if sn:
+                    serials.append(sn)
 
-            if len(chassis_list) > 0:
-                serial_number = ",".join(chassis_list)
-            elif len(chassis_list) == 0 and len(slot_list) > 0:
-                serial_number = ",".join(slot_list)
-            else:
-                serial_number = "Unknown"
+        interface_list = [str(iface) for iface in interfaces.keys() if iface and not iface.startswith(("_", "__"))]
 
         return {
-            "uptime": uptime,
-            "vendor": vendor,
-            "os_version": os_version,
-            "serial_number": serial_number,
-            "model": model,
+            "uptime": float(_safe_get(version, "uptime", 0.0)),
+            "vendor": str(_safe_get(version, "vendor")),
+            "os_version": str(_safe_get(version, "os_version")),
+            "model": str(_safe_get(version, "model")),
             "hostname": hostname,
-            "fqdn": fqdn,
+            "serial_number": ",".join(serials) if serials else "",
+            "fqdn": hostname,  # Default to hostname if FQDN not available
             "interface_list": interface_list,
         }
+
+    def _get_dns_host(self) -> List[Dict[str, Any]]:
+        """
+        This model's fpdn cannot be got.
+        """
+        cmd = "display dns host"
+        structured_output = self._get_structured_output(cmd)
+        return structured_output
+
+    def _get_version(self) -> Optional[VersionInfo]:
+        """
+        Get device version information including OS version, vendor, uptime and model.
+
+        Returns:
+            Optional dictionary containing:
+                - os_version (str): Operating system version
+                - vendor (str): Device vendor/manufacturer
+                - uptime (timedelta): Device uptime duration
+                - model (str): Device model
+            Returns None if version information cannot be retrieved.
+        """
+        cmd = "display version"
+        structured_output = self._get_structured_output(cmd)
+
+        logging.debug(f"Structured version info: {structured_output}")
+
+        if not isinstance(structured_output, list) or len(structured_output) != 1:
+            logging.error(f"Unexpected version output format: {structured_output}")
+            return None
+
+        try:
+            version_info = structured_output[0]
+            (uptime_str, vendor, model, os_version) = itemgetter("uptime", "vendor", "model", "os_version")(
+                version_info
+            )
+
+            uptime = parse_time(uptime_str)
+            if not all([uptime, vendor, model, os_version]):
+                raise ValueError("Missing required version fields")
+
+            return {"os_version": os_version, "vendor": vendor, "uptime": uptime, "model": model}
+
+        except (KeyError, ValueError, TypeError) as e:
+            logging.error(f"Failed to parse version info: {str(e)}")
+            return None
+
+    def _get_device_manuinfo(self) -> List[DeviceManuinfoItem]:
+        cmd = "display device manuinfo"
+        structured_output = self._get_structured_output(cmd)
+        result = []
+        for item in structured_output:
+            normalized = {
+                "chassis_id": item.get("chassis_id", ""),
+                "slot_type": item["slot_type"],
+                "slot_id": item["slot_id"],
+                "device_name": item["device_name"] or None,
+                "serial_number": SerialNumber(item["serial_number"]) if item["serial_number"] else None,
+                "manufacturing_date": item["manufacturing_date"],
+                "vendor_name": item["vendor_name"] or None,
+                "mac_address": MACAddress(item["mac_address"]) if item["mac_address"] else None,
+            }
+            result.append(normalized)
+        return result
 
     def get_interfaces(self) -> Dict[str, models.InterfaceDict]:
         interface_dict: Dict[str, models.InterfaceDict] = {}
@@ -167,7 +256,7 @@ class ComwareDriver(NetworkDriver):
                 interface_dict[interface_name] = interface_data
 
             except Exception as e:
-                print(f"Error processing interface {interface.get('interface')}: {e}")
+                logging.warning(f"Error processing interface {interface.get('interface')}: {e}")
                 continue
 
         return interface_dict
@@ -178,7 +267,7 @@ class ComwareDriver(NetworkDriver):
         is_enabled = "up" in link_status
         protocol_status_split = protocol_status.split()
         if len(protocol_status_split) == 0:
-            print(f"cannot get up status for interface: {interface}")
+            logging.warning(f"cannot get up status for interface: {interface}")
             is_up = False
         else:
             is_up = "up" in protocol_status_split[0]
@@ -209,29 +298,53 @@ class ComwareDriver(NetworkDriver):
         if "never" in flapping_str:
             return 0
         try:
-            return self._parse_time(flapping_str)  # 假设 _parse_time 返回 float 或 int
+            return self._parse_time(flapping_str)
         except Exception:
             return -1
 
     def _parse_time(self, time_str: str) -> int:
         return parse_time(time_str)
 
-    def get_lldp_neighbors(self):
-        lldp = {}
-        command = "display lldp neighbor-information verbose"
-        structured_output = self._get_structured_output(command)
-        for lldp_entry in structured_output:
-            (local_interface, remote_system_name, remote_port) = itemgetter(
-                "local_interface", "remote_system_name", "remote_port"
-            )(lldp_entry)
-            if lldp.get(local_interface) is None:
-                lldp[local_interface] = [{"hostname": remote_system_name, "port": remote_port}]
-            else:
-                lldp[local_interface].append({"hostname": remote_system_name, "port": remote_port})
-        return lldp
+    def get_lldp_neighbors(self) -> Dict[str, List[models.LLDPNeighborDict]]:
+        """Retrieve LLDP neighbors information with enhanced reliability.
 
-    def get_bgp_neighbors(self) -> None:
-        ...
+        Returns:
+            Dictionary where keys are local interface names and values are lists
+            of neighbor dictionaries containing:
+                - hostname: str
+                - port: str
+
+        Raises:
+            CommandErrorException: If LLDP command execution fails
+            ValueError: If data parsing fails
+        """
+        try:
+            command = "display lldp neighbor-information verbose"
+            structured_output = self._get_structured_output(command) or []
+        except Exception as e:
+            raise CommandErrorException(f"LLDP command failed: {str(e)}") from e
+
+        get_neighbor_fields = itemgetter("local_interface", "remote_system_name", "remote_port")
+
+        lldp_neighbors: Dict[str, List[models.LLDPNeighborDict]] = {}
+
+        for entry in structured_output:
+            try:
+                local_if, remote_name, remote_port = get_neighbor_fields(entry)
+
+                if not all((local_if, remote_name, remote_port)):
+                    continue
+
+                neighbor = {"hostname": str(remote_name).strip(), "port": str(remote_port).strip()}
+
+                lldp_neighbors.setdefault(str(local_if).strip(), []).append(neighbor)
+
+            except (KeyError, TypeError) as e:
+                continue
+            except Exception as e:
+                raise ValueError(f"LLDP data parsing error: {str(e)}") from e
+
+        return lldp_neighbors
 
     def _get_memory(self, verbose=True):
         memory = {}
@@ -441,7 +554,7 @@ class ComwareDriver(NetworkDriver):
                 lldp[local_interface].append(_)
         return lldp
 
-    def cli(self, commands: List):
+    def cli(self, commands: List, encoding: str = "text") -> Dict[str, Union[str, Dict[str, Any]]]:
         cli_output = dict()
 
         if type(commands) is not list:
