@@ -1,15 +1,15 @@
 import logging
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from operator import itemgetter
 from typing import (
     Any,
     Dict,
     List,
     Literal,
-    NewType,
     Optional,
-    TypeAlias,
-    TypedDict,
     Union,
 )
 
@@ -24,41 +24,32 @@ from napalm.base.netmiko_helpers import netmiko_args
 from netaddr import EUI
 from netmiko.hp.hp_comware import HPComwareBase
 
+from .types import (
+    ArpEntry,
+    CompactMemory,
+    CpuDict,
+    DeviceManuinfoItem,
+    EnvironmentDict,
+    FanDict,
+    FanInfo,
+    MACAddress,
+    MacMoveEntry,
+    MemoryEntry,
+    MemoryResult,
+    PowerDict,
+    SerialNumber,
+    TemperatureDict,
+    TemperatureInfo,
+    VerboseCpuInfo,
+    VersionInfo,
+)
 from .utils.helpers import (
     canonical_interface_name_comware,
-    get_value_from_list_of_dict,
     parse_time,
     strptime,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
-
-
-VersionInfo: TypeAlias = Dict[str, Union[str, int]]
-
-
-MACAddress = NewType("MACAddress", str)
-SerialNumber = NewType("SerialNumber", str)
-
-
-class DeviceManuinfoItem(TypedDict):
-    chassis_id: str
-    slot_type: Literal["Slot", "Fan", "Power"]
-    slot_id: str
-    device_name: Optional[str]
-    serial_number: Optional[SerialNumber]
-    manufacturing_date: Optional[str]
-    vendor_name: Optional[str]
-    mac_address: Optional[MACAddress]
-
-
-class MacMoveEntry(TypedDict):
-    mac: str
-    vlan: int
-    current_port: str
-    source_port: str
-    last_move: str
-    moves: int
 
 
 class ComwareDriver(NetworkDriver):
@@ -73,6 +64,9 @@ class ComwareDriver(NetworkDriver):
         self.password = password
         self.timeout = timeout
         self.netmiko_optional_args = netmiko_args(optional_args)
+        self._env_cache: Optional[EnvironmentDict] = None
+        self._cache_ttl = 30
+        self._last_update_time = 0
 
     def open(self) -> None:
         """Open a connection to the device."""
@@ -335,7 +329,10 @@ class ComwareDriver(NetworkDriver):
                 if not all((local_if, remote_name, remote_port)):
                     continue
 
-                neighbor = {"hostname": str(remote_name).strip(), "port": str(remote_port).strip()}
+                neighbor: models.LLDPNeighborDict = {
+                    "hostname": str(remote_name).strip(),
+                    "port": str(remote_port).strip(),
+                }
 
                 lldp_neighbors.setdefault(str(local_if).strip(), []).append(neighbor)
 
@@ -346,167 +343,364 @@ class ComwareDriver(NetworkDriver):
 
         return lldp_neighbors
 
-    def _get_memory(self, verbose=True):
-        memory = {}
-        command = "display memory"
-        structured_output = self._get_structured_output(command)
-        for mem_entry in structured_output:
-            (chassis, slot, total, used, free, free_ratio) = itemgetter(
-                "chassis", "slot", "total", "used", "free", "free_ratio"
-            )(mem_entry)
+    def _get_memory(self, verbose: Literal[True, False] = True) -> MemoryResult:
+        """获取设备内存信息（支持多板卡场景）
 
-            if chassis != "":
-                memory_key = f"chassis {chassis} slot {slot}"
-            elif chassis == "" and slot != "":
-                memory_key = f"slot {slot}"
+        Args:
+            verbose: 是否返回详细的多板卡信息
 
-            memory[memory_key] = {
-                "total_ram": int(total),
-                "used_ram": int(used),
-                "available_ram": int(free),
-                "free_ratio": float(free_ratio),
-            }
+        Returns:
+            当 verbose=True 时返回包含所有板卡详细信息的字典
+            当 verbose=False 时返回内存压力最大的板卡摘要信息
 
-        if verbose:
+        Raises:
+            CommandError: 设备命令执行失败时抛出
+            ValueError: 数据解析异常时抛出
+        """
+        memory: Dict[str, MemoryEntry] = {}
+        required_fields = ("chassis", "slot", "total", "used", "free", "free_ratio")
+
+        try:
+            structured_output = self._get_structured_output("display memory")
+            if not isinstance(structured_output, list):
+                raise ValueError("Invalid memory data format")
+
+            get_mem_fields = itemgetter(*required_fields)
+
+            for entry in structured_output:
+                try:
+                    chassis, slot, total, used, free, ratio = (str(field).strip() for field in get_mem_fields(entry))
+
+                    if not all((total.isdigit(), used.isdigit(), free.isdigit())):
+                        continue
+
+                    memory_key = f"chassis {chassis} slot {slot}" if chassis else f"slot {slot}" if slot else "default"
+
+                    memory[memory_key] = MemoryEntry(
+                        total_ram=int(total),
+                        used_ram=int(used),
+                        available_ram=int(free),
+                        free_ratio=float(ratio.strip("%")) if "%" in ratio else float(ratio),
+                    )
+
+                except (ValueError, AttributeError, KeyError):
+                    continue
+
+        except Exception as e:
+            raise CommandErrorException(f"Memory collection failed: {str(e)}") from e
+
+        if verbose or not memory:
             return memory
-        else:
-            # 为了适配 napalm api（只支持回显一条信息），如果有多个板卡的话，只返回使用空间最多的
-            # return info of the slot with max memory usage if device has more than one slot.
-            _mem = {}
-            _ = get_value_from_list_of_dict(list(memory.values()), "free_ratio", min)
-            _mem["used_ram"] = _.get("used_ram")
-            _mem["available_ram"] = _.get("available_ram")
-            return _mem
 
-    def _get_power(self, verbose=True):
-        # 盒式设备只有 Slot，框式设备只有 Chassis
-        power = {}
+        most_used = max(
+            memory.items(),
+            key=lambda x: (x[1]["used_ram"] / x[1]["total_ram"]),
+            default=(None, MemoryEntry(total_ram=0, used_ram=0, available_ram=0, free_ratio=0.0)),
+        )
+
+        return CompactMemory(used_ram=most_used[1]["used_ram"], available_ram=most_used[1]["available_ram"])
+
+    def _get_power(self) -> PowerDict:
+        """
+        获取设备电源信息
+
+        Returns:
+            电源信息字典，格式为:
+            {
+                "slot 1 power 1": {
+                    "status": True,  # 或"Normal"
+                    "capacity": -1,
+                    "output": "12.5V"
+                },
+                ...
+            }
+        """
+        power: PowerDict = {}
         command = "display power"
         structured_output = self._get_structured_output(command)
+
         for power_entry in structured_output:
-            (
-                chassis,
-                slot,
-                power_id,
-                status,
-                output,
-            ) = itemgetter(
-                "chassis", "slot", "power_id", "status", "power"
-            )(power_entry)
+            entry = itemgetter("chassis", "slot", "power_id", "status", "power")(power_entry)
+            chassis, slot, power_id, status, output = entry
 
-            if not verbose:
-                status = True if status.lower() == "normal" else False
+            processed_status = status.lower() == "normal"
 
-            if slot != "":
-                power_key = "slot %s power %s" % (slot, power_id)
-            elif chassis != "":
-                power_key = "chassis %s power %s" % (chassis, power_id)
-            else:
-                power_key = "power %s" % (power_id)
+            power_key = self._build_power_key(chassis, slot, power_id)
 
-            power[power_key] = {"status": status, "capacity": -1, "output": output}
+            try:
+                capacity = int(float(output.split()[0])) if output else -1
+            except (ValueError, AttributeError):
+                capacity = -1
+
+            power[power_key] = {"status": processed_status, "capacity": capacity, "output": output}
+
         return power
 
-    def _get_cpu(self, verbose=True):
-        cpu = {}
+    def _build_power_key(self, chassis: str, slot: str, power_id: str) -> str:
+        """
+        构建电源信息的键名
+
+        Args:
+            chassis: 机箱编号
+            slot: 插槽编号
+            power_id: 电源ID
+
+        Returns:
+            格式化后的键名字符串
+        """
+        if slot:
+            return f"slot {slot} power {power_id}"
+        if chassis:
+            return f"chassis {chassis} power {power_id}"
+        return f"power {power_id}"
+
+    def _get_cpu(self, verbose: bool = True) -> models.CPUDict:
+        """
+        获取设备CPU使用率信息
+
+        Args:
+            verbose: 返回详细数据(True返回三个时间维度的数据, False返回峰值使用率)
+
+        Returns:
+            CPU信息字典, 格式为:
+            verbose模式:
+            {
+                "Chassis 1 Slot 2 cpu 0": {
+                    "five_sec": 15.2,
+                    "one_min": 12.3,
+                    "five_min": 10.1
+                }
+            }
+            非verbose模式:
+            {
+                "Slot 3 cpu 1": {
+                    "%usage": 25.5  # 三个时间段中的最大值
+                }
+            }
+        """
+        cpu: models.CPUDict = {"%usage": 0}
         command = "display cpu-usage summary"
         structured_output = self._get_structured_output(command)
-        for cpu_entry in structured_output:
-            (chassis, slot, cpu_id, five_sec, one_min, five_min) = itemgetter(
-                "chassis", "slot", "cpu_id", "five_sec", "one_min", "five_min"
-            )(cpu_entry)
 
-            if chassis != "":
-                cpu_key = "Chassis %s Slot %s cpu %s" % (chassis, slot, cpu_id)
-            elif chassis == "" and slot != "":
-                cpu_key = "Slot %s cpu %s" % (slot, cpu_id)
-            else:
-                cpu_key = "cpu %s" % (cpu_id)
+        for cpu_entry in structured_output:
+            entry = itemgetter("chassis", "slot", "cpu_id", "five_sec", "one_min", "five_min")(cpu_entry)
+            chassis, slot, cpu_id, five_sec, one_min, five_min = entry
+
+            cpu_key = self._build_cpu_key(chassis, slot, cpu_id)
+
+            try:
+                five_sec_f = float(five_sec)
+                one_min_f = float(one_min)
+                five_min_f = float(five_min)
+            except (ValueError, TypeError) as e:
+                continue
 
             if verbose:
-                cpu[cpu_key] = {
-                    "five_sec": float(five_sec),
-                    "one_min": float(one_min),
-                    "five_min": float(five_min),
-                }
+                cpu[cpu_key] = VerboseCpuInfo(five_sec=five_sec_f, one_min=one_min_f, five_min=five_min_f)
             else:
-                cpu[cpu_key] = {
-                    r"%usage": float(max([five_sec, one_min, five_min])),
-                }
+                cpu[cpu_key] = {"%usage": max(five_sec_f, one_min_f, five_min_f)}
+
         return cpu
 
-    def _get_fan(self):
-        fans = {}
+    def _build_cpu_key(self, chassis: str, slot: str, cpu_id: str) -> str:
+        """
+        构建CPU信息的键名
+
+        Args:
+            chassis: 机箱编号
+            slot: 插槽编号
+            cpu_id: CPU标识符
+
+        Returns:
+            格式化后的键名字符串
+        """
+        if chassis:
+            return f"Chassis {chassis} Slot {slot} cpu {cpu_id}"
+        elif slot:
+            return f"Slot {slot} cpu {cpu_id}"
+        return f"cpu {cpu_id}"
+
+    def _get_fan(self) -> FanDict:
+        """
+        获取设备风扇状态信息
+
+        Returns:
+            风扇信息字典，格式为:
+            {
+                "Slot 1 Fan 2": {
+                    "status": True  # True表示正常(Normal)
+                },
+                "Chassis 2 Fan 3": {
+                    "status": False  # False表示异常
+                }
+            }
+        """
+        fans: FanDict = {}
         command = "display fan"
         structured_output = self._get_structured_output(command)
+
         for fan_entry in structured_output:
-            (
-                chassis,
-                slot,
-                fan_id,
-                status,
-            ) = itemgetter(
-                "chassis",
-                "slot",
-                "fan_id",
-                "status",
-            )(fan_entry)
-            status = True if status.lower() == "normal" else False
-            if slot != "":
-                fan_key = "Slot %s Fan %s" % (slot, fan_id)
-            elif chassis != "":
-                fan_key = "Chassis %s Fan %s" % (chassis, fan_id)
-            else:
-                fan_key = "Fan %s" % (fan_id)
-            fans[fan_key] = {"status": status}
+            chassis, slot, fan_id, status = itemgetter("chassis", "slot", "fan_id", "status")(fan_entry)
+
+            fan_key = self._build_fan_key(chassis, slot, fan_id)
+
+            status_bool = status.lower() == "normal"
+            fans[fan_key] = FanInfo(status=status_bool)
+
         return fans
 
-    def _get_temperature(self):
-        temperature = {}
+    def _build_fan_key(self, chassis: str, slot: str, fan_id: str) -> str:
+        """
+        构建风扇信息的键名
+
+        Args:
+            chassis: 机箱编号
+            slot: 插槽编号
+            fan_id: 风扇标识符
+
+        Returns:
+            格式化后的键名字符串
+        """
+        if slot:
+            return f"Slot {slot} Fan {fan_id}"
+        elif chassis:
+            return f"Chassis {chassis} Fan {fan_id}"
+        return f"Fan {fan_id}"
+
+    def _get_temperature(self) -> TemperatureDict:
+        """
+        获取设备温度传感器信息
+
+        Returns:
+            温度信息字典，格式为:
+            {
+                "chassis 1 slot 2 sensor 3": {
+                    "temperature": 45.2,
+                    "is_alert": True,
+                    "is_critical": False
+                },
+                "slot 4 sensor 1": {
+                    "temperature": 38.5,
+                    "is_alert": False,
+                    "is_critical": False
+                }
+            }
+        """
+        temperature: TemperatureDict = {}
         command = "display environment"
         structured_output = self._get_structured_output(command)
+
         for temp_entry in structured_output:
-            (chassis, slot, sensor, temp, alert, critical) = itemgetter(
+            chassis, slot, sensor, temp, alert, critical = itemgetter(
                 "chassis", "slot", "sensor", "temperature", "alert", "critical"
             )(temp_entry)
-            is_alert = True if float(temp) >= float(alert) else False
-            is_critical = True if float(temp) >= float(critical) else False
 
-            if chassis != "":
-                temp_key = "chassis %s slot %s sensor %s" % (chassis, slot, sensor)
-            else:
-                temp_key = "slot %s sensor %s" % (slot, sensor)
-            temperature[temp_key] = {
-                "temperature": float(temp),
-                "is_alert": is_alert,
-                "is_critical": is_critical,
-            }
+            try:
+                temp_f = float(temp)
+                alert_f = float(alert)
+                critical_f = float(critical)
+            except (ValueError, TypeError):
+                continue
+
+            temp_key = self._build_temp_key(chassis, slot, sensor)
+
+            temperature[temp_key] = TemperatureInfo(
+                temperature=temp_f, is_alert=temp_f >= alert_f, is_critical=temp_f >= critical_f
+            )
 
         return temperature
 
-    def get_environment(self):
-        environment = {}
+    def _build_temp_key(self, chassis: str, slot: str, sensor: str) -> str:
+        """
+        构建温度信息的键名
 
-        cpu = self._get_cpu(verbose=False)
-        environment["cpu"] = cpu
+        Args:
+            chassis: 机箱编号
+            slot: 插槽编号
+            sensor: 传感器标识符
 
-        memory = self._get_memory(verbose=False)
-        environment["memory"] = memory
+        Returns:
+            格式化后的键名字符串
+        """
+        if chassis:
+            return f"chassis {chassis} slot {slot} sensor {sensor}"
+        return f"slot {slot} sensor {sensor}"
 
-        power = self._get_power(verbose=False)
-        environment["power"] = power
+    def get_environment(self, use_cache: bool = True) -> EnvironmentDict:
+        """
+        获取设备环境数据（并行采集各子系统数据）
 
-        fans = self._get_fan()
-        environment["fans"] = fans
+        Args:
+            use_cache: 是否使用缓存数据(默认True), 设置为False强制刷新
 
-        temperature = self._get_temperature()
-        environment["temperature"] = temperature
+        Returns:
+            环境数据字典，结构为:
+            {
+                "cpu": Dict[str, Any],         # CPU使用率数据
+                "memory": Dict[str, Any],      # 内存使用数据
+                "power": Dict[str, Any],       # 电源状态数据
+                "fans": Dict[str, Any],        # 风扇状态数据
+                "temperature": Dict[str, Any]  # 温度传感器数据
+            }
+
+        Raises:
+            EnvironmentError: 当任何子系统数据获取失败时
+        """
+        if use_cache and self._is_cache_valid():
+            assert self._env_cache
+            return self._env_cache
+
+        try:
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                get_data = partial(self._get_subsystem_data, verbose=False)
+
+                future_cpu = executor.submit(get_data, "_get_cpu")
+                future_mem = executor.submit(get_data, "_get_memory")
+                future_power = executor.submit(self._get_power)
+                future_fans = executor.submit(self._get_fan)
+                future_temp = executor.submit(self._get_temperature)
+
+                environment = EnvironmentDict(
+                    cpu=future_cpu.result(),
+                    memory=future_mem.result(),
+                    power=future_power.result(),
+                    fans=future_fans.result(),
+                    temperature=future_temp.result(),
+                )
+
+            self._env_cache = environment
+            self._last_update_time = time.time()
+
+        except Exception as e:
+            logging.error(f"Environment data collection failed: {str(e)}")
+            raise EnvironmentError("Failed to collect environment data") from e
 
         return environment
 
+    def _validate_cpu_data(self, data: Any) -> Dict[int, models.CPUDict]:
+        if not isinstance(data, dict):
+            raise TypeError("CPU data must be a dictionary")
+        return {int(k): models.CPUDict(**v) for k, v in data.items()}
+
+    def _get_subsystem_data(self, method_name: str, **kwargs) -> Dict[str, Any]:
+        try:
+            method = getattr(self, method_name)
+            return method(**kwargs)
+        except Exception as e:
+            logging.error(f"Failed to get {method_name} data: {str(e)}")
+            return {}  # 返回空字典而不是终止整个流程
+
+    def _is_cache_valid(self) -> bool:
+        """检查缓存是否在有效期内"""
+        return self._env_cache is not None and (time.time() - self._last_update_time) < self._cache_ttl
+
+    def clear_cache(self):
+        """手动清除缓存"""
+        self._env_cache = None
+        self._last_update_time = 0
+
     def get_lldp_neighbors_detail(self, interface: str = ""):
         lldp = {}
-        # `parent_interface` is not supported
         parent_interface = ""
 
         if interface:
@@ -567,29 +761,46 @@ class ComwareDriver(NetworkDriver):
 
         return cli_output
 
-    def get_arp_table(self, vrf: str = ""):
-        arp_table = []
-        if vrf:
-            command = "display arp vpn-instance %s" % (vrf)
-        else:
-            command = "display arp"
-        structured_output = self._get_structured_output(command, "display_arp")
+    def get_arp_table(self, vrf: str = "") -> List[ArpEntry]:
+        """获取ARP表信息(支持VRF)
+
+        Args:
+            vrf: 可选参数, 指定VRF实例名称。默认为全局路由表
+
+        Returns:
+            标准化ARP条目列表, 每个条目包含:
+            - interface: 规范化后的接口名
+            - mac: 标准化的MAC地址
+            - ip: IP地址
+            - age: 老化时间(秒)
+
+        Raises:
+            CommandErrorException: CLI命令执行失败时
+            ValueError: 数据解析失败时
+        """
+        command = f"display arp vpn-instance {vrf}" if vrf else "display arp"
+        try:
+            structured_output: List[Dict[str, str]] = self._get_structured_output(command, template_name="display_arp")
+        except Exception as e:
+            raise CommandErrorException(f"ARP command excute error: {command}") from e
+
+        arp_table: List[ArpEntry] = []
+        required_fields = ("interface", "mac_address", "ip_address", "aging")
+        get_fields = itemgetter(*required_fields)
+
         for arp_entry in structured_output:
-            (
-                interface,
-                mac_address,
-                ip,
-                age,
-            ) = itemgetter(
-                "interface", "mac_address", "ip_address", "aging"
-            )(arp_entry)
-            entry = {
-                "interface": canonical_interface_name_comware(interface),
-                "mac": mac(mac_address),
-                "ip": ip,
-                "age": float(age),
-            }
-            arp_table.append(entry)
+            try:
+                interface, mac_addr, ip, age = get_fields(arp_entry)
+                entry: ArpEntry = {
+                    "interface": canonical_interface_name_comware(interface),
+                    "mac": mac(mac_addr),
+                    "ip": ip,
+                    "age": float(age),
+                }
+                arp_table.append(entry)
+            except (KeyError, ValueError) as e:
+                raise ValueError(f"无效ARP条目: {arp_entry}") from e
+
         return arp_table
 
     def get_interfaces_ip(self) -> Dict[str, models.InterfacesIPDict]:
@@ -710,28 +921,71 @@ class ComwareDriver(NetworkDriver):
 
         return mac_address_table
 
-    def get_route_to(self, destination="", protocol="", longer=False):
-        ...
+    def get_config(
+        self,
+        retrieve: Literal["all", "running", "startup", "candidate"] = "all",
+        full: bool = False,
+        sanitized: bool = False,
+        format: Literal["text", "json"] = "text",
+    ) -> models.ConfigDict:
+        """
+        获取设备配置信息
 
-    def get_config(self, retrieve="all", full=False, sanitized=False):
-        configs = {"startup": "", "running": "", "candidate": ""}
-        # Not Supported
-        if full:
-            pass
-        if retrieve.lower() in ("running", "all"):
-            command = "display current-configuration"
-            configs["running"] = self.send_command(command)
-        if retrieve.lower() in ("startup", "all"):
-            command = "display saved-configuration"
-            configs["startup"] = self.send_command(command)
-        # Ignore, plaintext will be encrypted.
-        # Remove secret data ? Not Implemented.
-        if sanitized:
-            pass
+        Args:
+            retrieve: 要检索的配置类型，可选值为:
+                - "all": 获取所有配置(默认)
+                - "running": 只获取运行配置
+                - "startup": 只获取启动配置
+                - "candidate": 候选配置(暂不支持)
+            full: 是否获取完整配置(暂不支持)
+            sanitized: 是否对敏感信息进行脱敏处理(暂不支持)
+            format: 返回格式，支持 "text" 或 "json"(暂不支持)
+
+        Returns:
+            包含配置信息的字典，格式为:
+            {
+                "startup": str,    # 启动配置
+                "running": str,    # 运行配置
+                "candidate": str   # 候选配置(暂为空字符串)
+            }
+
+        Raises:
+            ValueError: 当传入无效的retrieve参数时
+        """
+        if retrieve.lower() not in ("all", "running", "startup", "candidate"):
+            raise ValueError(f"Invalid retrieve value: {retrieve}. Must be one of: all, running, startup, candidate")
+
+        if format.lower() not in ("text", "json"):
+            raise ValueError(f"Unsupported format: {format}. Only 'text' or 'json' are supported")
+
+        configs: models.ConfigDict = {"startup": "", "running": "", "candidate": ""}
+
+        try:
+            if retrieve.lower() in ("running", "all"):
+                command = "display current-configuration"
+                configs["running"] = self.send_command(command)
+
+            if retrieve.lower() in ("startup", "all"):
+                command = "display saved-configuration"
+                configs["startup"] = self.send_command(command)
+
+            # TODO: 实现完整配置获取功能
+            if full:
+                logging.warning("Full config retrieval is not yet implemented")
+
+            # TODO: 实现配置脱敏功能
+            if sanitized:
+                logging.warning("Config sanitization is not yet implemented")
+
+            # TODO: 实现格式转换功能
+            if format.lower() == "json":
+                logging.warning("JSON format is not yet implemented")
+
+        except Exception as e:
+            logging.error(f"Failed to retrieve config: {str(e)}")
+            raise
+
         return configs
-
-    def get_network_instances(self, name: str = ""):
-        ...
 
     def get_vlans(self):
         """

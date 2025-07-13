@@ -15,5 +15,5 @@ def device():
         timeout=200,
         optional_args={"read_output_override": 300, "fast_cli": False, "conn_timeout": 150, "global_delay_factor": 30},
     )
-    dev._get_structured_output = MagicMock()  # Mock the output method
+    dev._get_structured_output = MagicMock()
     return dev
