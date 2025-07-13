@@ -1,5 +1,7 @@
 from typing import (
+    DefaultDict,
     Dict,
+    List,
     Literal,
     NewType,
     Optional,
@@ -97,3 +99,19 @@ class ArpEntry(TypedDict):
     mac: str
     ip: str
     age: float
+
+
+class VlanInfo(TypedDict):
+    name: str
+    interfaces: List[str]
+
+
+VlansDict = Dict[str, VlanInfo]
+
+
+class IrfPortConfig(TypedDict):
+    irf_port1: List[str]
+    irf_port2: List[str]
+
+
+IrfConfigDict = Dict[int, IrfPortConfig]

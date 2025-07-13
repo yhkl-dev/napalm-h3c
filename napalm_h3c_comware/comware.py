@@ -4,14 +4,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from operator import itemgetter
-from typing import (
-    Any,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Union,
-)
+from typing import Any, DefaultDict, Dict, List, Literal, Optional, Union, cast
 
 from napalm.base import models
 from napalm.base.base import NetworkDriver
@@ -32,6 +25,8 @@ from .types import (
     EnvironmentDict,
     FanDict,
     FanInfo,
+    IrfConfigDict,
+    IrfPortConfig,
     MACAddress,
     MacMoveEntry,
     MemoryEntry,
@@ -344,7 +339,7 @@ class ComwareDriver(NetworkDriver):
         return lldp_neighbors
 
     def _get_memory(self, verbose: Literal[True, False] = True) -> MemoryResult:
-        """获取设备内存信息（支持多板卡场景）
+        """获取设备内存信息(支持多板卡场景)
 
         Args:
             verbose: 是否返回详细的多板卡信息
@@ -405,7 +400,7 @@ class ComwareDriver(NetworkDriver):
         获取设备电源信息
 
         Returns:
-            电源信息字典，格式为:
+            电源信息字典,格式为:
             {
                 "slot 1 power 1": {
                     "status": True,  # 或"Normal"
@@ -525,7 +520,7 @@ class ComwareDriver(NetworkDriver):
         获取设备风扇状态信息
 
         Returns:
-            风扇信息字典，格式为:
+            风扇信息字典,格式为:
             {
                 "Slot 1 Fan 2": {
                     "status": True  # True表示正常(Normal)
@@ -572,7 +567,7 @@ class ComwareDriver(NetworkDriver):
         获取设备温度传感器信息
 
         Returns:
-            温度信息字典，格式为:
+            温度信息字典,格式为:
             {
                 "chassis 1 slot 2 sensor 3": {
                     "temperature": 45.2,
@@ -626,15 +621,15 @@ class ComwareDriver(NetworkDriver):
             return f"chassis {chassis} slot {slot} sensor {sensor}"
         return f"slot {slot} sensor {sensor}"
 
-    def get_environment(self, use_cache: bool = True) -> EnvironmentDict:
+    def get_environment(self, use_cache: bool = True) -> EnvironmentDict:  # type: ignore
         """
-        获取设备环境数据（并行采集各子系统数据）
+        获取设备环境数据(并行采集各子系统数据)
 
         Args:
             use_cache: 是否使用缓存数据(默认True), 设置为False强制刷新
 
         Returns:
-            环境数据字典，结构为:
+            环境数据字典,结构为:
             {
                 "cpu": Dict[str, Any],         # CPU使用率数据
                 "memory": Dict[str, Any],      # 内存使用数据
@@ -677,25 +672,18 @@ class ComwareDriver(NetworkDriver):
 
         return environment
 
-    def _validate_cpu_data(self, data: Any) -> Dict[int, models.CPUDict]:
-        if not isinstance(data, dict):
-            raise TypeError("CPU data must be a dictionary")
-        return {int(k): models.CPUDict(**v) for k, v in data.items()}
-
     def _get_subsystem_data(self, method_name: str, **kwargs) -> Dict[str, Any]:
         try:
             method = getattr(self, method_name)
             return method(**kwargs)
         except Exception as e:
             logging.error(f"Failed to get {method_name} data: {str(e)}")
-            return {}  # 返回空字典而不是终止整个流程
+            return {}
 
     def _is_cache_valid(self) -> bool:
-        """检查缓存是否在有效期内"""
         return self._env_cache is not None and (time.time() - self._last_update_time) < self._cache_ttl
 
     def clear_cache(self):
-        """手动清除缓存"""
         self._env_cache = None
         self._last_update_time = 0
 
@@ -873,7 +861,6 @@ class ComwareDriver(NetworkDriver):
                     moves,
                 ) = field_getter(mac_move_entry)
 
-                # Create normalized entry
                 entry: MacMoveEntry = {
                     "mac": str(EUI(mac_address)),
                     "vlan": int(vlan),
@@ -885,8 +872,7 @@ class ComwareDriver(NetworkDriver):
                 mac_address_move_table.append(entry)
 
             except (KeyError, ValueError, AttributeError) as e:
-                # here we should show warning or log error
-                print(f"error: {e}")
+                logging.warning(f"error when execute command: {command},error: {e}")
                 continue
 
         return mac_address_move_table
@@ -923,26 +909,26 @@ class ComwareDriver(NetworkDriver):
 
     def get_config(
         self,
-        retrieve: Literal["all", "running", "startup", "candidate"] = "all",
+        retrieve: str = "all",
         full: bool = False,
         sanitized: bool = False,
-        format: Literal["text", "json"] = "text",
+        format: str = "text",
     ) -> models.ConfigDict:
         """
         获取设备配置信息
 
         Args:
-            retrieve: 要检索的配置类型，可选值为:
+            retrieve: 要检索的配置类型,可选值为:
                 - "all": 获取所有配置(默认)
                 - "running": 只获取运行配置
                 - "startup": 只获取启动配置
                 - "candidate": 候选配置(暂不支持)
             full: 是否获取完整配置(暂不支持)
             sanitized: 是否对敏感信息进行脱敏处理(暂不支持)
-            format: 返回格式，支持 "text" 或 "json"(暂不支持)
+            format: 返回格式,支持 "text" 或 "json"(暂不支持)
 
         Returns:
-            包含配置信息的字典，格式为:
+            包含配置信息的字典,格式为:
             {
                 "startup": str,    # 启动配置
                 "running": str,    # 运行配置
@@ -987,66 +973,92 @@ class ComwareDriver(NetworkDriver):
 
         return configs
 
-    def get_vlans(self):
-        """
-        Return structure being spit balled is as follows.
-            * vlan_id (int)
-                * name (text_type)
-                * interfaces (list)
+    def get_vlans(self) -> Dict[str, models.VlanDict]:
+        """获取设备VLAN信息
 
-        By default, `vlan_name` == `vlan_description`. If both are default or not, \
-        use `vlan_name`. If one of them is not the default value, use user-configured \
-        value.
+        Returns:
+            结构化VLAN信息字典,格式:
+            {
+                vlan_id(int): {
+                    "name": str,          # VLAN名称(优先使用非默认描述)
+                    "interfaces": List[str]  # 关联接口列表
+                }
+            }
 
-        Example::
+        Raises:
+            CommandError: 命令执行失败时
+            ValueError: 数据解析失败时
 
+        Example:
             {
                 1: {
                     "name": "default",
-                    "interfaces": ["GigabitEthernet0/0/1", "GigabitEthernet0/0/2"]
+                    "interfaces": ["GigabitEthernet0/0/1"]
                 },
-                2: {
-                    "name": "vlan2",
+                100: {
+                    "name": "mgmt_vlan",
                     "interfaces": []
                 }
             }
         """
-        vlans = {}
+        DEFAULT_VLAN_PREFIX = "VLAN "
         command = "display vlan all"
-        structured_output = self._get_structured_output(command)
+        try:
+            structured_output: List[Dict[str, Union[str, List[str]]]] = self._get_structured_output(command)
+        except Exception as e:
+            raise CommandErrorException(f"VLAN command execute failed: {command}") from e
+
+        vlans = {}
+        required_fields = ("vlan_id", "name", "description", "interfaces")
+        get_fields = itemgetter(*required_fields)
+
         for vlan_entry in structured_output:
-            vlan_name = vlan_entry.get("name")
-            vlan_desc = vlan_entry.get("description")
-            vlans[int(vlan_entry.get("vlan_id"))] = {
-                "name": vlan_desc if "VLAN " not in vlan_desc and "VLAN " in vlan_name else vlan_name,
-                "interfaces": vlan_entry.get("interfaces"),
-            }
+            try:
+                vlan_id, name, desc, interfaces = get_fields(vlan_entry)
+                final_name = (
+                    desc if not desc.startswith(DEFAULT_VLAN_PREFIX) and name.startswith(DEFAULT_VLAN_PREFIX) else name
+                )
+
+                vlans[vlan_id] = {
+                    "name": final_name.strip(),
+                    "interfaces": [canonical_interface_name_comware(iface) for iface in interfaces if iface],
+                }
+            except (KeyError, ValueError, AttributeError) as e:
+                raise ValueError(f"invalid vala item: {vlan_entry}") from e
+
         return vlans
 
-    def get_irf_config(self):
-        """
-        Returns a dictionary of dictionaries where the first key is irf member ID,
-        and the internal dictionary uses the irf port type as the key and port member as the value.
-
-        Example::
-            {
-                1: {
-                    'irf-port1': ['FortyGigE1/0/53', 'FortyGigE1/0/54'],
-                    'irf-port2': [],
-                }
-                2: {
-                    'irf-port1': [],
-                    'irf-port2': ['FortyGigE2/0/53', 'FortyGigE2/0/54'],
-                }
-            }
-        """
-        irf_config = defaultdict(dict)
+    def get_irf_config(self) -> IrfConfigDict:
         command = "display current-configuration configuration irf-port"
-        structured_output = self._get_structured_output(command)
+        try:
+            structured_output = self._get_structured_output(command)
+        except Exception as e:
+            raise CommandErrorException(f"IRF配置命令执行失败: {command}") from e
+
+        temp_config: Dict[int, Dict[str, List[str]]] = defaultdict(lambda: {"irf-port1": [], "irf-port2": []})
+
         for config in structured_output:
-            (member_id, port_id, port_member) = itemgetter("member_id", "port_id", "port_member")(config)
-            irf_config[int(member_id)]["irf-port%s" % port_id] = port_member
-        return irf_config
+            try:
+                member_id = int(config["member_id"])
+                port_id = str(config["port_id"])
+                port_member = config["port_member"] or []
+                port_key = f"irf-port{port_id}"
+
+                if port_key not in ("irf-port1", "irf-port2"):
+                    continue
+
+                temp_config[member_id][port_key] = [self._normalize_interface(iface) for iface in port_member if iface]
+            except (KeyError, ValueError) as e:
+                raise ValueError(f"无效IRF配置条目: {config}") from e
+
+        final_config = {
+            member_id: cast(IrfPortConfig, {"irf_port1": ports["irf-port1"], "irf_port2": ports["irf-port2"]})
+            for member_id, ports in temp_config.items()
+        }
+        return final_config
+
+    def _normalize_interface(self, interface: str) -> str:
+        return interface.strip().replace(" ", "")
 
     def is_irf(self):
         """
