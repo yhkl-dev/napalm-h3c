@@ -930,9 +930,9 @@ class ComwareDriver(NetworkDriver):
         Returns:
             包含配置信息的字典,格式为:
             {
-                "startup": str,    # 启动配置
-                "running": str,    # 运行配置
-                "candidate": str   # 候选配置(暂为空字符串)
+                "startup": str,
+                "running": str,
+                "candidate": str
             }
 
         Raises:
@@ -949,11 +949,11 @@ class ComwareDriver(NetworkDriver):
         try:
             if retrieve.lower() in ("running", "all"):
                 command = "display current-configuration"
-                configs["running"] = self.send_command(command)
+                configs["running"] = self.send_command(command)  # type: ignore
 
             if retrieve.lower() in ("startup", "all"):
                 command = "display saved-configuration"
-                configs["startup"] = self.send_command(command)
+                configs["startup"] = self.send_command(command)  # type: ignore
 
             # TODO: 实现完整配置获取功能
             if full:
