@@ -1,18 +1,22 @@
 from typing import (
-    DefaultDict,
     Dict,
     List,
     Literal,
     NewType,
     Optional,
-    TypeAlias,
     TypedDict,
     Union,
 )
 
 from napalm.base import models
 
-VersionInfo: TypeAlias = Dict[str, Union[str, int]]
+
+class VersionInfo(TypedDict):
+    os_version: str
+    vendor: str
+    uptime: int
+    model: str
+
 
 MACAddress = NewType("MACAddress", str)
 SerialNumber = NewType("SerialNumber", str)
@@ -31,11 +35,7 @@ CpuInfo = Union[VerboseCpuInfo, models.CPUDict]
 CpuDict = Dict[str, CpuInfo]
 
 
-class FanInfo(TypedDict):
-    status: bool
-
-
-FanDict = Dict[str, FanInfo]
+FanDict = Dict[str, models.FanDict]
 
 
 class MemoryEntry(TypedDict):
@@ -73,25 +73,15 @@ class MacMoveEntry(TypedDict):
     moves: int
 
 
-class TemperatureInfo(TypedDict):
-    temperature: float
-    is_alert: bool
-    is_critical: bool
+TemperatureDict = Dict[str, models.TemperatureDict]
 
 
-TemperatureDict = Dict[str, TemperatureInfo]
-
-
-EnvironmentDict = TypedDict(
-    "EnvironmentDict",
-    {
-        "fans": FanDict,
-        "temperature": TemperatureDict,
-        "power": PowerDict,
-        "cpu": CpuDict,
-        "memory": MemoryResult,
-    },
-)
+class EnvironmentDict(TypedDict):
+    fans: FanDict
+    temperature: TemperatureDict
+    power: PowerDict
+    cpu: Dict[int, models.CPUDict]
+    memory: models.MemoryDict
 
 
 class ArpEntry(TypedDict):

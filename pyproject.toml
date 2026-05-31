@@ -1,17 +1,16 @@
 [project]
 name = "napalm-h3c"
 version = "0.1.0"
-description = ""
+description = "NAPALM driver for H3C Comware"
 authors = [
-    {name = "Kai Yang",email = "kaiyang939325@gmail.com"}
+    {name = "Kai Yang", email = "kaiyang939325@gmail.com"}
 ]
 license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.9,<4.0"
 dependencies = [
-    "napalm (==5.0.0)"
+    "napalm==5.0.0"
 ]
-
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
@@ -20,6 +19,9 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry]
 packages = [
     { include = "napalm_h3c_comware" }
+]
+include = [
+    { path = "telnetlib.py", format = ["sdist", "wheel"] }
 ]
 
 [[tool.poetry.source]]
@@ -33,3 +35,29 @@ flake8 = "^7.3.0"
 black = "^25.1.0"
 pre-commit = "^4.2.0"
 mypy = "^1.16.1"
+isort = "^5.13.2"
+
+[tool.black]
+line-length = 120
+
+[tool.isort]
+profile = "black"
+line_length = 120
+
+[tool.mypy]
+python_version = "3.9"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["napalm.*", "netmiko.*", "netaddr.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["napalm_h3c_comware._compat.telnetlib"]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
