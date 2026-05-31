@@ -162,7 +162,7 @@ class ComwareDriver(NetworkDriver):
         probes_received = int(received_match.group(1))
         result: models.PingDict = {
             "probes_sent": probes_sent,
-            "packet_loss": probes_sent - probes_received,
+            "packet_loss": (probes_sent - probes_received) / probes_sent * 100 if probes_sent > 0 else 0.0,
             "rtt_min": 0.0,
             "rtt_max": 0.0,
             "rtt_avg": 0.0,
@@ -1036,13 +1036,13 @@ class ComwareDriver(NetworkDriver):
         structured_output = self._get_structured_output(command)
         mac_address_move_table = self.get_mac_address_move_table()
 
-        move_by_mac = {entry["mac"]: entry for entry in mac_address_move_table}
+        move_by_mac = {(entry["mac"], entry["vlan"]): entry for entry in mac_address_move_table}
 
         mac_address_table: List[models.MACAdressTable] = []
         for mac_entry in structured_output:
             (mac_address, vlan, state, interface) = itemgetter("mac_address", "vlan", "state", "interface")(mac_entry)
             normalized_mac = mac(mac_address)
-            move_info = move_by_mac.get(normalized_mac)
+            move_info = move_by_mac.get((normalized_mac, int(vlan)))
             entry: models.MACAdressTable = {
                 "mac": normalized_mac,
                 "interface": canonical_interface_name_comware(interface),
