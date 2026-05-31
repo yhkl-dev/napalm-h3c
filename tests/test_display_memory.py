@@ -1,10 +1,15 @@
+import os
+
 import pytest
 from textfsm import TextFSM
 
 
 @pytest.fixture
 def memory_template():
-    with open("napalm_h3c_comware/utils/textfsm_templates/display_memory.tpl") as f:
+    template_path = os.path.join(
+        os.path.dirname(__file__), "../napalm_h3c_comware/utils/textfsm_templates/display_memory.tpl"
+    )
+    with open(template_path) as f:
         return TextFSM(f)
 
 
@@ -46,6 +51,5 @@ Mem:        506408    362496    143912         0      1376    123024
 Swap:            0         0         0
     """
     result = memory_template.ParseText(output)
-    print(result)
     assert result[0][1] == "1"
     assert result[0][4] == ""

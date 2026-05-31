@@ -1,10 +1,16 @@
+import os
+
 import pytest
 from textfsm import TextFSM
 
 
 @pytest.fixture
 def lldp_template():
-    with open("napalm_h3c_comware/utils/textfsm_templates/display_lldp_neighbor-information_verbose.tpl") as f:
+    template_path = os.path.join(
+        os.path.dirname(__file__),
+        "../napalm_h3c_comware/utils/textfsm_templates/display_lldp_neighbor-information_verbose.tpl",
+    )
+    with open(template_path) as f:
         return TextFSM(f)
 
 

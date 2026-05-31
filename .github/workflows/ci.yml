@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: snok/install-poetry@v1
+        with:
+          version: "2.2.1"
+
+      - run: poetry install --no-interaction
+
+      - run: poetry run mypy napalm_h3c_comware/comware.py napalm_h3c_comware/types.py
+      - run: poetry run pytest -q tests/test_parse_time.py tests/test_comware_additions.py tests/test_telnetlib_shim.py tests/test_get_interfaces_ip.py tests/test_display_memory.py tests/test_lldp_parser.py
