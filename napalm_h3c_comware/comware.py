@@ -24,7 +24,6 @@ from netmiko.hp.hp_comware import HPComwareBase
 
 from .types import (
     ArpEntry,
-    CompactMemory,
     DeviceManuinfoItem,
     EnvironmentDict,
     FanDict,
@@ -33,7 +32,6 @@ from .types import (
     MACAddress,
     MacMoveEntry,
     MemoryEntry,
-    MemoryResult,
     PowerDict,
     SerialNumber,
     TemperatureDict,
@@ -66,26 +64,6 @@ def _parse_number(value: str) -> Union[int, float]:
     return float(value) if "." in value else int(value)
 
 
-def _parse_elapsed_time(value: str) -> int:
-    normalized = value.strip().lower()
-    if not normalized or normalized in {"--", "never", "none"}:
-        return 0
-    if re.fullmatch(r"\d+:\d{2}:\d{2}", normalized):
-        hours, minutes, seconds = (int(part) for part in normalized.split(":"))
-        return (hours * 3600) + (minutes * 60) + seconds
-    if re.fullmatch(r"\d+:\d{2}", normalized):
-        minutes, seconds = (int(part) for part in normalized.split(":"))
-        return (minutes * 60) + seconds
-
-    units = {"y": 365 * 24 * 3600, "w": 7 * 24 * 3600, "d": 24 * 3600, "h": 3600, "m": 60, "s": 1}
-    matches = re.findall(r"(\d+)\s*([ywdhms])", normalized)
-    if matches:
-        return sum(int(amount) * units[unit] for amount, unit in matches)
-    if normalized.isdigit():
-        return int(normalized)
-    return 0
-
-
 def _normalize_routing_table_name(name: str) -> str:
     normalized = name.strip()
     if normalized.lower() in {"_public_", "public", "default"}:
@@ -98,22 +76,28 @@ def _normalize_outgoing_interface(name: str) -> str:
 
 
 def _has_cli_error(output: str) -> bool:
-    normalized = output.strip().lower()
+    normalized = output.strip()
     if not normalized:
         return False
+    if normalized.startswith("%"):
+        return True
+    if "\n ^" in normalized:
+        return True
+    lower_output = normalized.lower()
+    if lower_output.startswith("error:"):
+        return True
+    if "\nerror:" in lower_output:
+        return True
     error_markers = (
-        "error:",
-        "failed",
-        "not found",
-        "cannot ",
-        "can't ",
-        "invalid",
         "incomplete command",
         "ambiguous command",
         "wrong parameter",
         "no such file",
+        "too many parameters",
+        "unrecognized command",
+        "syntax error",
     )
-    return normalized.startswith("%") or any(marker in normalized for marker in error_markers) or "\n ^" in normalized
+    return any(marker in lower_output for marker in error_markers)
 
 
 def _parse_directory_timestamps(output: str, target_files: List[str]) -> Dict[str, int]:
@@ -194,6 +178,8 @@ class ComwareDriver(NetworkDriver):
         self._replace_candidate = False
         self._last_backup_file: Optional[str] = None
         self._device_lock = threading.Lock()
+        self._running_config_lines: Optional[List[str]] = None
+        self._running_config_text: Optional[str] = None
 
     def open(self) -> None:
         """Open a connection to the device."""
@@ -217,16 +203,22 @@ class ComwareDriver(NetworkDriver):
         self.close()
 
     def send_command(self, command: str, *args: Any, **kwargs: Any) -> str:
+        if self.device is None:
+            raise CommandErrorException("Device is not connected — call open() first")
         with self._device_lock:
-            return str(cast(HPComwareBase, self.device).send_command(command, *args, **kwargs))
+            return str(self.device.send_command(command, *args, **kwargs))
 
     def send_config_set(self, config_commands: List[str], *args: Any, **kwargs: Any) -> str:
+        if self.device is None:
+            raise CommandErrorException("Device is not connected — call open() first")
         with self._device_lock:
-            return str(cast(HPComwareBase, self.device).send_config_set(config_commands, *args, **kwargs))
+            return str(self.device.send_config_set(config_commands, *args, **kwargs))
 
     def find_prompt(self) -> str:
+        if self.device is None:
+            raise CommandErrorException("Device is not connected — call open() first")
         with self._device_lock:
-            return str(cast(HPComwareBase, self.device).find_prompt())
+            return str(self.device.find_prompt())
 
     def is_alive(self) -> models.AliveDict:
         try:
@@ -422,6 +414,7 @@ class ComwareDriver(NetworkDriver):
             re.M,
         )
 
+        peers: List[tuple[str, str, str, str, bool, bool, int, str]] = []
         for match in peer_pattern.finditer(output):
             peer_ip = match.group("peer")
             state_field = match.group("state")
@@ -429,14 +422,35 @@ class ComwareDriver(NetworkDriver):
             is_up = state_name.lower() == "established"
             is_enabled = "admin" not in state_name.lower()
             received_prefixes = int(prefix_count) if prefix_count.isdigit() else 0
+            address_family = "ipv6 unicast" if ":" in peer_ip else "ipv4 unicast"
+            peers.append(
+                (
+                    peer_ip,
+                    match.group("remote_as"),
+                    match.group("uptime"),
+                    address_family,
+                    is_up,
+                    is_enabled,
+                    received_prefixes,
+                    state_name,
+                )
+            )
+
+        peer_details: Dict[str, str] = {}
+        if peers:
+            with ThreadPoolExecutor(max_workers=min(len(peers), 10)) as executor:
+                futures = {executor.submit(self.send_command, f"display bgp peer {p[0]}"): p[0] for p in peers}
+                for future in futures:
+                    try:
+                        peer_details[futures[future]] = future.result()
+                    except Exception:
+                        peer_details[futures[future]] = ""
+
+        for peer_ip, remote_as, uptime, address_family, is_up, is_enabled, received_prefixes, _ in peers:
+            peer_detail = peer_details.get(peer_ip, "")
             sent_prefixes = 0
             remote_id = ""
             description = ""
-
-            try:
-                peer_detail = self.send_command(f"display bgp peer {peer_ip}")
-            except Exception:
-                peer_detail = ""
 
             remote_id_match = re.search(r"remote router ID\s+(?P<remote_id>\S+)", peer_detail, re.I)
             if remote_id_match:
@@ -456,15 +470,14 @@ class ComwareDriver(NetworkDriver):
             if sent_prefix_match:
                 sent_prefixes = int(sent_prefix_match.group("count") or sent_prefix_match.group("sent") or 0)
 
-            address_family = "ipv6 unicast" if ":" in peer_ip else "ipv4 unicast"
             result["global"]["peers"][peer_ip] = {
                 "local_as": local_as,
-                "remote_as": int(match.group("remote_as")),
+                "remote_as": int(remote_as),
                 "remote_id": remote_id,
                 "is_up": is_up,
                 "is_enabled": is_enabled,
                 "description": description,
-                "uptime": _parse_elapsed_time(match.group("uptime")),
+                "uptime": parse_time(uptime),
                 "address_family": {
                     address_family: {
                         "received_prefixes": received_prefixes,
@@ -526,7 +539,7 @@ class ComwareDriver(NetworkDriver):
                 "protocol": route_protocol.upper(),
                 "current_active": True,
                 "last_active": False,
-                "age": _parse_elapsed_time(match.group("age") or ""),
+                "age": parse_time(match.group("age") or ""),
                 "next_hop": match.group("next_hop"),
                 "outgoing_interface": _normalize_outgoing_interface(match.group("interface")),
                 "selected_next_hop": "R" not in match.group("flags"),
@@ -567,7 +580,7 @@ class ComwareDriver(NetworkDriver):
                 "protocol": route_protocol.upper(),
                 "current_active": True,
                 "last_active": False,
-                "age": _parse_elapsed_time(age_match.group("age")) if age_match else 0,
+                "age": parse_time(age_match.group("age")) if age_match else 0,
                 "next_hop": next_hop_match.group("next_hop"),
                 "outgoing_interface": _normalize_outgoing_interface(interface_match.group("interface")),
                 "selected_next_hop": True,
@@ -853,15 +866,15 @@ class ComwareDriver(NetworkDriver):
 
         return lldp_neighbors
 
-    def _get_memory(self, verbose: Literal[True, False] = True) -> MemoryResult:
+    def _get_memory(self, verbose: Literal[True, False] = True) -> Dict[str, MemoryEntry]:
         """Get device memory info (multi-slot support).
 
         Args:
             verbose: Whether to return detailed per-slot info.
 
         Returns:
-            When verbose=True, returns dict with all slot details.
-            When verbose=False, returns summary of most utilized slot.
+            When verbose=True, returns dict with per-slot details.
+            When verbose=False, returns dict with single "summary" key for most utilized slot.
 
         Raises:
             CommandErrorException: If device command fails.
@@ -905,7 +918,7 @@ class ComwareDriver(NetworkDriver):
             default=(None, MemoryEntry(total_ram=0, used_ram=0, available_ram=0, free_ratio=0.0)),
         )
 
-        return CompactMemory(used_ram=most_used[1]["used_ram"], available_ram=most_used[1]["available_ram"])
+        return {"summary": most_used[1]}
 
     def _get_power(self) -> PowerDict:
         """Get device power supply info.
@@ -1063,7 +1076,11 @@ class ComwareDriver(NetworkDriver):
                 }
 
                 raw_cpu = futures["cpu"].result()
-                raw_memory = cast(models.MemoryDict, futures["memory"].result())
+                raw_memory: Dict[str, MemoryEntry] = futures["memory"].result()
+                summary_memory = raw_memory.get(
+                    "summary",
+                    MemoryEntry(total_ram=0, used_ram=0, available_ram=0, free_ratio=0.0),
+                )
                 cpu_usage: Dict[int, models.CPUDict] = {}
 
                 for cpu_key, cpu_data in raw_cpu.items():
@@ -1076,7 +1093,7 @@ class ComwareDriver(NetworkDriver):
 
                 environment = EnvironmentDict(
                     cpu=cpu_usage,
-                    memory=raw_memory,
+                    memory={"available_ram": summary_memory["available_ram"], "used_ram": summary_memory["used_ram"]},
                     power=futures["power"].result(),
                     fans=futures["fans"].result(),
                     temperature=futures["temperature"].result(),
@@ -1255,7 +1272,7 @@ class ComwareDriver(NetworkDriver):
         try:
             structured_output = self._get_structured_output(command)
         except Exception as e:
-            raise RuntimeError(f"Failed to execute '{command}': {str(e)}") from e
+            raise CommandErrorException(f"Failed to execute '{command}': {str(e)}") from e
 
         for iface_entry in structured_output:
             try:
@@ -1302,7 +1319,7 @@ class ComwareDriver(NetworkDriver):
         try:
             structured_output = self._get_structured_output(command)
         except Exception as e:
-            raise RuntimeError(f"Failed to execute '{command}': {str(e)}") from e
+            raise CommandErrorException(f"Failed to execute '{command}': {str(e)}") from e
 
         mac_address_move_table: List[MacMoveEntry] = []
         field_getter = itemgetter("mac_address", "vlan", "current_port", "source_port", "last_move", "times")
@@ -1334,12 +1351,14 @@ class ComwareDriver(NetworkDriver):
 
         return mac_address_move_table
 
-    def get_mac_address_table(self) -> List[models.MACAdressTable]:
+    def get_mac_address_table(self, move_table: Optional[List[MacMoveEntry]] = None) -> List[models.MACAdressTable]:
         command = "display mac-address"
         structured_output = self._get_structured_output(command)
-        mac_address_move_table = self.get_mac_address_move_table()
 
-        move_by_mac = {(entry["mac"], entry["vlan"]): entry for entry in mac_address_move_table}
+        if move_table is not None:
+            move_by_mac = {(entry["mac"], entry["vlan"]): entry for entry in move_table}
+        else:
+            move_by_mac = {}
 
         mac_address_table: List[models.MACAdressTable] = []
         for mac_entry in structured_output:
@@ -1402,15 +1421,15 @@ class ComwareDriver(NetworkDriver):
 
             # TODO: implement full config retrieval
             if full:
-                logger.warning("Full config retrieval is not yet implemented")
+                raise NotImplementedError("Full config retrieval is not yet implemented")
 
             # TODO: implement config sanitization
             if sanitized:
-                logger.warning("Config sanitization is not yet implemented")
+                raise NotImplementedError("Config sanitization is not yet implemented")
 
             # TODO: implement output format conversion
             if format.lower() == "json":
-                logger.warning("JSON format is not yet implemented")
+                raise NotImplementedError("JSON format is not yet implemented")
 
         except Exception as e:
             logger.error(f"Failed to retrieve config: {str(e)}")
@@ -1463,6 +1482,8 @@ class ComwareDriver(NetworkDriver):
     def discard_config(self) -> None:
         self._candidate_config = ""
         self._replace_candidate = False
+        self._running_config_lines = None
+        self._running_config_text = None
 
     def commit_config(self, message: str = "", revert_in: Optional[int] = None) -> None:
         if message:
@@ -1497,12 +1518,17 @@ class ComwareDriver(NetworkDriver):
             self.send_config_set(commands)
             self.send_command("save force")
         except Exception as exc:
+            self._running_config_lines = None
+            self._running_config_text = None
             raise CommitError("Failed to commit candidate config on Comware") from exc
 
+        self._running_config_lines = None
+        self._running_config_text = None
         self.discard_config()
 
     def rollback(self) -> None:
-        cast(HPComwareBase, self.device)
+        if self.device is None:
+            raise ReplaceConfigException("Rollback failed: device is not connected")
         backup_files = self._get_backup_files_for_rollback()
 
         for backup_file in backup_files:
@@ -1522,6 +1548,8 @@ class ComwareDriver(NetworkDriver):
                     raise ReplaceConfigException("Rollback restored config but failed to save it")
 
                 self._last_backup_file = backup_file
+                self._running_config_lines = None
+                self._running_config_text = None
                 self.discard_config()
                 return
         raise ReplaceConfigException("Rollback failed: no backup config found on flash")
@@ -1649,7 +1677,8 @@ class ComwareDriver(NetworkDriver):
 
         for line in self._get_running_config_lines():
             community_match = re.match(
-                r"^snmp-agent community (?P<mode>read|write) (?:(?:cipher|simple)\s+)?(?P<name>\S+)(?: acl (?P<acl>\S+))?",
+                r"^snmp-agent community (?P<mode>read|write) "
+                r"(?:(?:cipher|simple)\s+)?(?P<name>\S+)(?: acl (?P<acl>\S+))?",
                 line,
             )
             if community_match:
@@ -1772,7 +1801,11 @@ class ComwareDriver(NetworkDriver):
         return config
 
     def _get_running_config_lines(self) -> List[str]:
-        return [line.strip() for line in self.get_config(retrieve="running")["running"].splitlines() if line.strip()]
+        if self._running_config_lines is None:
+            raw = self.get_config(retrieve="running")["running"]
+            self._running_config_text = raw
+            self._running_config_lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        return self._running_config_lines
 
     @staticmethod
     def _separate_section(separator: str, content: str) -> List[str]:
@@ -1791,12 +1824,10 @@ class ComwareDriver(NetworkDriver):
         return [header + next(section_iter, "") for header in section_iter]
 
     @staticmethod
-    def _process_count_match(matches: List[tuple[str, str]], index: int) -> int:
-        if len(matches) <= index:
-            return 0
-        for item in matches[index]:
-            if item:
-                return int(item)
+    def _process_count_match(matches: List[tuple[str, ...]], index: int) -> int:
+        for match in matches:
+            if index < len(match) and match[index]:
+                return int(match[index])
         return 0
 
     @staticmethod
@@ -1812,7 +1843,8 @@ class ComwareDriver(NetworkDriver):
 
     def get_users(self) -> Dict[str, models.UsersDict]:
         users: Dict[str, models.UsersDict] = {}
-        config = self.get_config(retrieve="running")["running"]
+        self._get_running_config_lines()
+        config = self._running_config_text or ""
         blocks = re.split(r"(?m)^\s*#\s*$", config)
 
         for block in blocks:

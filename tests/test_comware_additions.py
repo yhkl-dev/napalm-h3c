@@ -121,6 +121,7 @@ class TestConfigWorkflow:
             device.commit_config(revert_in=300)
 
     def test_rollback_from_merge_backup(self, device):
+        device.device = MagicMock()
         calls = []
 
         def side_effect(cmd):
@@ -138,6 +139,7 @@ class TestConfigWorkflow:
         assert calls[-1] == "save force"
 
     def test_rollback_fallback_to_replace_backup(self, device):
+        device.device = MagicMock()
         calls = []
 
         def side_effect(cmd):
@@ -155,6 +157,7 @@ class TestConfigWorkflow:
         assert calls[-1] == "save force"
 
     def test_rollback_prefers_most_recent_backup(self, device):
+        device.device = MagicMock()
         device._last_backup_file = "backup-before-replace.cfg"
         calls = []
 
@@ -175,6 +178,7 @@ class TestConfigWorkflow:
         assert "rollback configuration to file backup-before-merge.cfg" not in calls
 
     def test_rollback_prefers_newest_backup_from_directory_listing(self, device):
+        device.device = MagicMock()
         calls = []
 
         def side_effect(cmd):
@@ -198,6 +202,7 @@ class TestConfigWorkflow:
         assert "rollback configuration to file backup-before-merge.cfg" not in calls
 
     def test_rollback_falls_back_to_legacy_replace_command(self, device):
+        device.device = MagicMock()
         calls = []
 
         def side_effect(cmd):
@@ -220,6 +225,7 @@ class TestConfigWorkflow:
         assert calls[-1] == "save force"
 
     def test_rollback_treats_cli_error_text_as_failure(self, device):
+        device.device = MagicMock()
         calls = []
 
         def side_effect(cmd):
@@ -243,6 +249,7 @@ class TestConfigWorkflow:
         ]
 
     def test_rollback_fails_when_no_backup(self, device):
+        device.device = MagicMock()
         device.send_command = MagicMock(side_effect=Exception("not found"))
         with pytest.raises(Exception, match="no backup config found"):
             device.rollback()
@@ -471,18 +478,37 @@ class TestOperationalParsers:
             device.traceroute("8.8.8.8", timeout="2\ndisplay version")  # type: ignore[arg-type]
 
     def test_get_mac_address_table_uses_normalized_move_keys(self, device):
-        device._get_structured_output.side_effect = [
-            [{"mac_address": "0012-3456-789a", "vlan": "10", "state": "dynamic", "interface": "GigabitEthernet1/0/1"}],
-            [
-                {
-                    "mac_address": "0012-3456-789a",
-                    "vlan": "10",
-                    "current_port": "GigabitEthernet1/0/1",
-                    "source_port": "GigabitEthernet1/0/2",
-                    "last_move": "2024-01-02 03:04:05",
-                    "times": "7",
-                }
-            ],
+        device._get_structured_output.return_value = [
+            {"mac_address": "0012-3456-789a", "vlan": "10", "state": "dynamic", "interface": "GigabitEthernet1/0/1"},
+        ]
+        move_table = [
+            {
+                "mac": "00:12:34:56:78:9A",
+                "vlan": 10,
+                "current_port": "GigabitEthernet1/0/1",
+                "source_port": "GigabitEthernet1/0/2",
+                "last_move": "2024-01-02 03:04:05",
+                "moves": 7,
+            }
+        ]
+
+        result = device.get_mac_address_table(move_table=move_table)
+
+        assert result == [
+            {
+                "mac": "00:12:34:56:78:9A",
+                "interface": "GigabitEthernet1/0/1",
+                "vlan": 10,
+                "static": False,
+                "active": True,
+                "last_move": strptime("2024-01-02 03:04:05"),
+                "moves": 7,
+            }
+        ]
+
+    def test_get_mac_address_table_without_move_data(self, device):
+        device._get_structured_output.return_value = [
+            {"mac_address": "0012-3456-789a", "vlan": "10", "state": "dynamic", "interface": "GigabitEthernet1/0/1"},
         ]
 
         result = device.get_mac_address_table()
@@ -494,8 +520,8 @@ class TestOperationalParsers:
                 "vlan": 10,
                 "static": False,
                 "active": True,
-                "last_move": strptime("2024-01-02 03:04:05"),
-                "moves": 7,
+                "last_move": -1.0,
+                "moves": -1,
             }
         ]
 

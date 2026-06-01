@@ -5,7 +5,6 @@ from typing import (
     NewType,
     Optional,
     TypedDict,
-    Union,
 )
 
 from napalm.base import models
@@ -31,10 +30,6 @@ class VerboseCpuInfo(TypedDict):
     five_min: float
 
 
-CpuInfo = Union[VerboseCpuInfo, models.CPUDict]
-CpuDict = Dict[str, CpuInfo]
-
-
 FanDict = Dict[str, models.FanDict]
 
 
@@ -43,14 +38,6 @@ class MemoryEntry(TypedDict):
     used_ram: int
     available_ram: int
     free_ratio: float
-
-
-class CompactMemory(TypedDict):
-    used_ram: int
-    available_ram: int
-
-
-MemoryResult = Union[Dict[str, MemoryEntry], CompactMemory]
 
 
 class DeviceManuinfoItem(TypedDict):
@@ -89,14 +76,6 @@ class ArpEntry(TypedDict):
     mac: str
     ip: str
     age: float
-
-
-class VlanInfo(TypedDict):
-    name: str
-    interfaces: List[str]
-
-
-VlansDict = Dict[str, VlanInfo]
 
 
 class IrfPortConfig(TypedDict):
