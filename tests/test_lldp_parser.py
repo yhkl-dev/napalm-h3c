@@ -1,7 +1,7 @@
 import os
 
 import pytest
-from textfsm import TextFSM
+from textfsm import TextFSM  # type: ignore[import-untyped]
 
 
 @pytest.fixture

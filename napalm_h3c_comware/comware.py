@@ -4,6 +4,7 @@ import difflib
 import ipaddress
 import logging
 import re
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -132,6 +133,38 @@ def _parse_directory_timestamps(output: str, target_files: List[str]) -> Dict[st
     return file_timestamps
 
 
+def _validate_cli_token(
+    value: str, field_name: str, *, allow_network: bool = False, allow_hostname: bool = False
+) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} cannot be empty")
+    if re.search(r"[\s\x00-\x1f\x7f]", normalized):
+        raise ValueError(f"Invalid {field_name}: whitespace and control characters are not allowed")
+
+    try:
+        if allow_network:
+            ipaddress.ip_network(normalized, strict=False)
+        else:
+            ipaddress.ip_address(normalized)
+        return normalized
+    except ValueError:
+        if allow_hostname and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,253}[A-Za-z0-9])?", normalized):
+            return normalized
+        raise ValueError(f"Invalid {field_name}: {value}")
+
+
+def _validate_int_argument(value: Any, field_name: str, *, minimum: int = 1, maximum: Optional[int] = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Invalid {field_name}: {value}")
+    validated_value = cast(int, value)
+    if validated_value < minimum:
+        raise ValueError(f"Invalid {field_name}: {value}")
+    if maximum is not None and validated_value > maximum:
+        raise ValueError(f"Invalid {field_name}: {value}")
+    return validated_value
+
+
 class ComwareDriver(NetworkDriver):
     _DEFAULT_VLAN_PREFIX = "VLAN "
     _BACKUP_CONFIG_FILES = ("backup-before-merge.cfg", "backup-before-replace.cfg")
@@ -160,6 +193,7 @@ class ComwareDriver(NetworkDriver):
         self._candidate_config = ""
         self._replace_candidate = False
         self._last_backup_file: Optional[str] = None
+        self._device_lock = threading.Lock()
 
     def open(self) -> None:
         """Open a connection to the device."""
@@ -183,7 +217,16 @@ class ComwareDriver(NetworkDriver):
         self.close()
 
     def send_command(self, command: str, *args: Any, **kwargs: Any) -> str:
-        return str(cast(HPComwareBase, self.device).send_command(command, *args, **kwargs))
+        with self._device_lock:
+            return str(cast(HPComwareBase, self.device).send_command(command, *args, **kwargs))
+
+    def send_config_set(self, config_commands: List[str], *args: Any, **kwargs: Any) -> str:
+        with self._device_lock:
+            return str(cast(HPComwareBase, self.device).send_config_set(config_commands, *args, **kwargs))
+
+    def find_prompt(self) -> str:
+        with self._device_lock:
+            return str(cast(HPComwareBase, self.device).find_prompt())
 
     def is_alive(self) -> models.AliveDict:
         try:
@@ -208,12 +251,19 @@ class ComwareDriver(NetworkDriver):
         if source_interface:
             raise NotImplementedError("source_interface ping is not supported on Comware yet")
 
-        command = f"ping -t {timeout * 1000} -s {size} -c {count}"
-        if ttl != 255:
-            command += f" -h {ttl}"
-        if source:
-            command += f" -a {source}"
-        command += f" {destination}"
+        validated_destination = _validate_cli_token(destination, "ping destination", allow_hostname=True)
+        validated_source = _validate_cli_token(source, "ping source") if source else ""
+        validated_timeout = _validate_int_argument(timeout, "ping timeout")
+        validated_size = _validate_int_argument(size, "ping size")
+        validated_count = _validate_int_argument(count, "ping count")
+        validated_ttl = _validate_int_argument(ttl, "ping ttl", maximum=255)
+
+        command = f"ping -t {validated_timeout * 1000} -s {validated_size} -c {validated_count}"
+        if validated_ttl != 255:
+            command += f" -h {validated_ttl}"
+        if validated_source:
+            command += f" -a {validated_source}"
+        command += f" {validated_destination}"
 
         output = self.send_command(command)
         if re.search(r"(?i)\berror\b|unknown host|unreachable", output):
@@ -265,10 +315,15 @@ class ComwareDriver(NetworkDriver):
         if vrf:
             raise NotImplementedError("VRF-aware traceroute is not supported on Comware yet")
 
-        command = f"tracert -m {ttl} -w {timeout * 1000}"
-        if source:
-            command += f" -a {source}"
-        command += f" {destination}"
+        validated_destination = _validate_cli_token(destination, "traceroute destination", allow_hostname=True)
+        validated_source = _validate_cli_token(source, "traceroute source") if source else ""
+        validated_timeout = _validate_int_argument(timeout, "traceroute timeout")
+        validated_ttl = _validate_int_argument(ttl, "traceroute ttl", maximum=255)
+
+        command = f"tracert -m {validated_ttl} -w {validated_timeout * 1000}"
+        if validated_source:
+            command += f" -a {validated_source}"
+        command += f" {validated_destination}"
 
         output = self.send_command(command)
         if re.search(r"(?i)\berror\b|unknown host|unreachable", output):
@@ -428,10 +483,11 @@ class ComwareDriver(NetworkDriver):
             raise NotImplementedError("longer route lookup is not supported on Comware yet")
         if not destination:
             return {}
-        if ":" in destination:
+        validated_destination = _validate_cli_token(destination, "route destination", allow_network=True)
+        if ":" in validated_destination:
             raise NotImplementedError("IPv6 route lookup is not supported on Comware yet")
 
-        output = self.send_command(f"display ip routing-table {destination} verbose")
+        output = self.send_command(f"display ip routing-table {validated_destination} verbose")
         if not output.strip():
             return {}
 
@@ -559,7 +615,7 @@ class ComwareDriver(NetworkDriver):
 
         try:
             version = cast(Dict[str, Any], self._get_version()) or {}
-            hostname = cast(HPComwareBase, self.device).find_prompt()[1:-1]
+            hostname = self.find_prompt()[1:-1]
             manuinfo = self._get_device_manuinfo() or []
             interfaces = self.get_interfaces() or {}
         except Exception as e:
@@ -998,15 +1054,16 @@ class ComwareDriver(NetworkDriver):
         try:
             with ThreadPoolExecutor(max_workers=5) as executor:
                 get_data = partial(self._get_subsystem_data, verbose=False)
+                futures = {
+                    "cpu": executor.submit(get_data, "_get_cpu"),
+                    "memory": executor.submit(get_data, "_get_memory"),
+                    "power": executor.submit(self._get_power),
+                    "fans": executor.submit(self._get_fan),
+                    "temperature": executor.submit(self._get_temperature),
+                }
 
-                future_cpu = executor.submit(get_data, "_get_cpu")
-                future_mem = executor.submit(get_data, "_get_memory")
-                future_power = executor.submit(self._get_power)
-                future_fans = executor.submit(self._get_fan)
-                future_temp = executor.submit(self._get_temperature)
-
-                raw_cpu = future_cpu.result()
-                raw_memory = cast(models.MemoryDict, future_mem.result())
+                raw_cpu = futures["cpu"].result()
+                raw_memory = cast(models.MemoryDict, futures["memory"].result())
                 cpu_usage: Dict[int, models.CPUDict] = {}
 
                 for cpu_key, cpu_data in raw_cpu.items():
@@ -1020,17 +1077,16 @@ class ComwareDriver(NetworkDriver):
                 environment = EnvironmentDict(
                     cpu=cpu_usage,
                     memory=raw_memory,
-                    power=future_power.result(),
-                    fans=future_fans.result(),
-                    temperature=future_temp.result(),
+                    power=futures["power"].result(),
+                    fans=futures["fans"].result(),
+                    temperature=futures["temperature"].result(),
                 )
-
-            self._env_cache = environment
-            self._last_update_time = time.time()
-
         except Exception as e:
             logger.error(f"Environment data collection failed: {str(e)}")
             raise RuntimeError("Failed to collect environment data") from e
+
+        self._env_cache = environment
+        self._last_update_time = time.time()
 
         return environment
 
@@ -1040,7 +1096,7 @@ class ComwareDriver(NetworkDriver):
             return cast(Dict[str, Any], method(**kwargs))
         except Exception as e:
             logger.error(f"Failed to get {method_name} data: {str(e)}")
-            return {}
+            raise RuntimeError(f"Failed to get {method_name} data") from e
 
     def _is_cache_valid(self) -> bool:
         return self._env_cache is not None and (time.time() - self._last_update_time) < self._cache_ttl
@@ -1112,7 +1168,7 @@ class ComwareDriver(NetworkDriver):
             raise TypeError("commands must contain only strings")
 
         for command in commands:
-            cli_output[command] = str(cast(HPComwareBase, self.device).send_command(command))
+            cli_output[command] = self.send_command(command)
 
         return cli_output
 
@@ -1437,9 +1493,8 @@ class ComwareDriver(NetworkDriver):
         except Exception:
             logger.warning(f"Failed to save pre-commit backup to {backup_file}, proceeding anyway")
 
-        device = cast(HPComwareBase, self.device)
         try:
-            device.send_config_set(commands)
+            self.send_config_set(commands)
             self.send_command("save force")
         except Exception as exc:
             raise CommitError("Failed to commit candidate config on Comware") from exc

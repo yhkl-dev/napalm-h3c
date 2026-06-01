@@ -1,3 +1,6 @@
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -17,6 +20,18 @@ class TestEnvironmentAndLldpRegressions:
         result = device.get_environment(use_cache=False)
 
         assert result["cpu"] == {0: {"%usage": 23.0}}
+
+    def test_get_environment_raises_on_subsystem_failure(self, device):
+        device._get_cpu = MagicMock(side_effect=RuntimeError("cpu failed"))
+        device._get_memory = MagicMock(return_value={"available_ram": 100, "used_ram": 50})
+        device._get_power = MagicMock(return_value={})
+        device._get_fan = MagicMock(return_value={})
+        device._get_temperature = MagicMock(return_value={})
+
+        with pytest.raises(RuntimeError, match="Failed to collect environment data"):
+            device.get_environment(use_cache=False)
+
+        assert device._env_cache is None
 
     def test_lldp_detail_joins_list_description(self, device):
         device._get_structured_output.return_value = [
@@ -418,6 +433,14 @@ class TestOperationalParsers:
 
         assert device.ping("bad-host") == {"error": "Error: Failed to resolve host"}
 
+    def test_ping_rejects_command_injection_input(self, device):
+        with pytest.raises(ValueError, match="Invalid ping destination"):
+            device.ping("192.0.2.1\ndisplay current-configuration")
+
+    def test_ping_rejects_invalid_numeric_arguments(self, device):
+        with pytest.raises(ValueError, match="Invalid ping ttl"):
+            device.ping("192.0.2.1", ttl="1\ndisplay current-configuration")  # type: ignore[arg-type]
+
     def test_traceroute_success(self, device):
         device.send_command = MagicMock(
             return_value=(
@@ -438,6 +461,14 @@ class TestOperationalParsers:
         assert result["success"][3]["probes"][1] == {"host_name": "*", "ip_address": "*", "rtt": -1.0}
         assert result["success"][4]["probes"][1]["host_name"] == "core-gw"
         assert result["success"][5]["probes"][3]["rtt"] == 32.0
+
+    def test_traceroute_rejects_invalid_source(self, device):
+        with pytest.raises(ValueError, match="Invalid traceroute source"):
+            device.traceroute("8.8.8.8", source="192.0.2.1\tfoo")
+
+    def test_traceroute_rejects_invalid_numeric_arguments(self, device):
+        with pytest.raises(ValueError, match="Invalid traceroute timeout"):
+            device.traceroute("8.8.8.8", timeout="2\ndisplay version")  # type: ignore[arg-type]
 
     def test_get_mac_address_table_uses_normalized_move_keys(self, device):
         device._get_structured_output.side_effect = [
@@ -578,6 +609,10 @@ class TestOperationalParsers:
         with pytest.raises(NotImplementedError, match="IPv6 route lookup"):
             device.get_route_to("2001:db8::/64")
 
+    def test_get_route_to_rejects_invalid_destination(self, device):
+        with pytest.raises(ValueError, match="Invalid route destination"):
+            device.get_route_to("10.1.2.0/24\nscreen-length disable")
+
     def test_get_interfaces_counters(self, device):
         device.send_command = MagicMock(
             return_value=(
@@ -642,3 +677,54 @@ class TestOperationalParsers:
                 "state": "Stale",
             },
         ]
+
+    def test_send_command_serializes_device_access(self, device):
+        device.device = MagicMock()
+        active_calls = 0
+        max_concurrent_calls = 0
+        state_lock = threading.Lock()
+
+        def fake_send_command(command, *args, **kwargs):
+            nonlocal active_calls, max_concurrent_calls
+            with state_lock:
+                active_calls += 1
+                max_concurrent_calls = max(max_concurrent_calls, active_calls)
+            time.sleep(0.02)
+            with state_lock:
+                active_calls -= 1
+            return command
+
+        device.device.send_command.side_effect = fake_send_command
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(device.send_command, [f"cmd-{idx}" for idx in range(4)]))
+
+        assert results == ["cmd-0", "cmd-1", "cmd-2", "cmd-3"]
+        assert max_concurrent_calls == 1
+
+    def test_other_device_io_uses_same_lock(self, device):
+        device.device = MagicMock()
+        active_calls = 0
+        max_concurrent_calls = 0
+        state_lock = threading.Lock()
+
+        def track_call(result):
+            nonlocal active_calls, max_concurrent_calls
+            with state_lock:
+                active_calls += 1
+                max_concurrent_calls = max(max_concurrent_calls, active_calls)
+            time.sleep(0.02)
+            with state_lock:
+                active_calls -= 1
+            return result
+
+        device.device.find_prompt.side_effect = lambda: track_call("<sysname>")
+        device.device.send_config_set.side_effect = lambda commands: track_call("\n".join(commands))
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            prompt_future = executor.submit(device.find_prompt)
+            config_future = executor.submit(device.send_config_set, ["sysname test-sw"])
+
+        assert prompt_future.result() == "<sysname>"
+        assert config_future.result() == "sysname test-sw"
+        assert max_concurrent_calls == 1
