@@ -66,26 +66,6 @@ def _parse_number(value: str) -> Union[int, float]:
     return float(value) if "." in value else int(value)
 
 
-def _parse_elapsed_time(value: str) -> int:
-    normalized = value.strip().lower()
-    if not normalized or normalized in {"--", "never", "none"}:
-        return 0
-    if re.fullmatch(r"\d+:\d{2}:\d{2}", normalized):
-        hours, minutes, seconds = (int(part) for part in normalized.split(":"))
-        return (hours * 3600) + (minutes * 60) + seconds
-    if re.fullmatch(r"\d+:\d{2}", normalized):
-        minutes, seconds = (int(part) for part in normalized.split(":"))
-        return (minutes * 60) + seconds
-
-    units = {"y": 365 * 24 * 3600, "w": 7 * 24 * 3600, "d": 24 * 3600, "h": 3600, "m": 60, "s": 1}
-    matches = re.findall(r"(\d+)\s*([ywdhms])", normalized)
-    if matches:
-        return sum(int(amount) * units[unit] for amount, unit in matches)
-    if normalized.isdigit():
-        return int(normalized)
-    return 0
-
-
 def _normalize_routing_table_name(name: str) -> str:
     normalized = name.strip()
     if normalized.lower() in {"_public_", "public", "default"}:
@@ -98,22 +78,28 @@ def _normalize_outgoing_interface(name: str) -> str:
 
 
 def _has_cli_error(output: str) -> bool:
-    normalized = output.strip().lower()
+    normalized = output.strip()
     if not normalized:
         return False
+    if normalized.startswith("%"):
+        return True
+    if "\n ^" in normalized:
+        return True
+    lower_output = normalized.lower()
+    if lower_output.startswith("error:"):
+        return True
+    if "\nerror:" in lower_output:
+        return True
     error_markers = (
-        "error:",
-        "failed",
-        "not found",
-        "cannot ",
-        "can't ",
-        "invalid",
         "incomplete command",
         "ambiguous command",
         "wrong parameter",
         "no such file",
+        "too many parameters",
+        "unrecognized command",
+        "syntax error",
     )
-    return normalized.startswith("%") or any(marker in normalized for marker in error_markers) or "\n ^" in normalized
+    return any(marker in lower_output for marker in error_markers)
 
 
 def _parse_directory_timestamps(output: str, target_files: List[str]) -> Dict[str, int]:
@@ -464,7 +450,7 @@ class ComwareDriver(NetworkDriver):
                 "is_up": is_up,
                 "is_enabled": is_enabled,
                 "description": description,
-                "uptime": _parse_elapsed_time(match.group("uptime")),
+                "uptime": parse_time(match.group("uptime")),
                 "address_family": {
                     address_family: {
                         "received_prefixes": received_prefixes,
@@ -526,7 +512,7 @@ class ComwareDriver(NetworkDriver):
                 "protocol": route_protocol.upper(),
                 "current_active": True,
                 "last_active": False,
-                "age": _parse_elapsed_time(match.group("age") or ""),
+                "age": parse_time(match.group("age") or ""),
                 "next_hop": match.group("next_hop"),
                 "outgoing_interface": _normalize_outgoing_interface(match.group("interface")),
                 "selected_next_hop": "R" not in match.group("flags"),
@@ -567,7 +553,7 @@ class ComwareDriver(NetworkDriver):
                 "protocol": route_protocol.upper(),
                 "current_active": True,
                 "last_active": False,
-                "age": _parse_elapsed_time(age_match.group("age")) if age_match else 0,
+                "age": parse_time(age_match.group("age")) if age_match else 0,
                 "next_hop": next_hop_match.group("next_hop"),
                 "outgoing_interface": _normalize_outgoing_interface(interface_match.group("interface")),
                 "selected_next_hop": True,
@@ -1402,15 +1388,15 @@ class ComwareDriver(NetworkDriver):
 
             # TODO: implement full config retrieval
             if full:
-                logger.warning("Full config retrieval is not yet implemented")
+                raise NotImplementedError("Full config retrieval is not yet implemented")
 
             # TODO: implement config sanitization
             if sanitized:
-                logger.warning("Config sanitization is not yet implemented")
+                raise NotImplementedError("Config sanitization is not yet implemented")
 
             # TODO: implement output format conversion
             if format.lower() == "json":
-                logger.warning("JSON format is not yet implemented")
+                raise NotImplementedError("JSON format is not yet implemented")
 
         except Exception as e:
             logger.error(f"Failed to retrieve config: {str(e)}")
@@ -1502,7 +1488,8 @@ class ComwareDriver(NetworkDriver):
         self.discard_config()
 
     def rollback(self) -> None:
-        cast(HPComwareBase, self.device)
+        if self.device is None:
+            raise ReplaceConfigException("Rollback failed: device is not connected")
         backup_files = self._get_backup_files_for_rollback()
 
         for backup_file in backup_files:
@@ -1649,7 +1636,8 @@ class ComwareDriver(NetworkDriver):
 
         for line in self._get_running_config_lines():
             community_match = re.match(
-                r"^snmp-agent community (?P<mode>read|write) (?:(?:cipher|simple)\s+)?(?P<name>\S+)(?: acl (?P<acl>\S+))?",
+                r"^snmp-agent community (?P<mode>read|write) "
+                r"(?:(?:cipher|simple)\s+)?(?P<name>\S+)(?: acl (?P<acl>\S+))?",
                 line,
             )
             if community_match:
@@ -1791,12 +1779,10 @@ class ComwareDriver(NetworkDriver):
         return [header + next(section_iter, "") for header in section_iter]
 
     @staticmethod
-    def _process_count_match(matches: List[tuple[str, str]], index: int) -> int:
-        if len(matches) <= index:
-            return 0
-        for item in matches[index]:
-            if item:
-                return int(item)
+    def _process_count_match(matches: List[tuple[str, ...]], index: int) -> int:
+        for match in matches:
+            if index < len(match) and match[index]:
+                return int(match[index])
         return 0
 
     @staticmethod
