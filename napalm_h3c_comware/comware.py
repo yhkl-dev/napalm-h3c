@@ -1,6 +1,7 @@
 # pyright: reportMissingTypeStubs=false
 
 import difflib
+import ipaddress
 import logging
 import re
 import time
@@ -38,11 +39,7 @@ from .types import (
     VerboseCpuInfo,
     VersionInfo,
 )
-from .utils.helpers import (
-    canonical_interface_name_comware,
-    parse_time,
-    strptime,
-)
+from .utils.helpers import canonical_interface_name_comware, parse_time, strptime
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +65,76 @@ def _parse_number(value: str) -> Union[int, float]:
     return float(value) if "." in value else int(value)
 
 
+def _parse_elapsed_time(value: str) -> int:
+    normalized = value.strip().lower()
+    if not normalized or normalized in {"--", "never", "none"}:
+        return 0
+    if re.fullmatch(r"\d+:\d{2}:\d{2}", normalized):
+        hours, minutes, seconds = (int(part) for part in normalized.split(":"))
+        return (hours * 3600) + (minutes * 60) + seconds
+    if re.fullmatch(r"\d+:\d{2}", normalized):
+        minutes, seconds = (int(part) for part in normalized.split(":"))
+        return (minutes * 60) + seconds
+
+    units = {"y": 365 * 24 * 3600, "w": 7 * 24 * 3600, "d": 24 * 3600, "h": 3600, "m": 60, "s": 1}
+    matches = re.findall(r"(\d+)\s*([ywdhms])", normalized)
+    if matches:
+        return sum(int(amount) * units[unit] for amount, unit in matches)
+    if normalized.isdigit():
+        return int(normalized)
+    return 0
+
+
+def _normalize_routing_table_name(name: str) -> str:
+    normalized = name.strip()
+    if normalized.lower() in {"_public_", "public", "default"}:
+        return "global"
+    return normalized
+
+
+def _normalize_outgoing_interface(name: str) -> str:
+    return canonical_interface_name_comware(name) if name and name not in {"NULLO", "-"} else name
+
+
+def _has_cli_error(output: str) -> bool:
+    normalized = output.strip().lower()
+    if not normalized:
+        return False
+    error_markers = (
+        "error:",
+        "failed",
+        "not found",
+        "cannot ",
+        "can't ",
+        "invalid",
+        "incomplete command",
+        "ambiguous command",
+        "wrong parameter",
+        "no such file",
+    )
+    return normalized.startswith("%") or any(marker in normalized for marker in error_markers) or "\n ^" in normalized
+
+
+def _parse_directory_timestamps(output: str, target_files: List[str]) -> Dict[str, int]:
+    file_timestamps: Dict[str, int] = {}
+    target_names = set(target_files)
+    pattern = re.compile(
+        r"^\s*\d+\s+\S+\s+\S+\s+(?P<timestamp>[A-Z][a-z]{2}\s+\d{2}\s+\d{4}\s+\d{2}:\d{2}:\d{2})\s+(?P<name>\S+)\s*$"
+    )
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if match is None:
+            continue
+        name = match.group("name")
+        if name not in target_names:
+            continue
+        file_timestamps[name] = int(time.mktime(time.strptime(match.group("timestamp"), "%b %d %Y %H:%M:%S")))
+    return file_timestamps
+
+
 class ComwareDriver(NetworkDriver):
     _DEFAULT_VLAN_PREFIX = "VLAN "
+    _BACKUP_CONFIG_FILES = ("backup-before-merge.cfg", "backup-before-replace.cfg")
 
     def __init__(
         self,
@@ -94,6 +159,7 @@ class ComwareDriver(NetworkDriver):
         self._last_update_time = 0.0
         self._candidate_config = ""
         self._replace_candidate = False
+        self._last_backup_file: Optional[str] = None
 
     def open(self) -> None:
         """Open a connection to the device."""
@@ -276,6 +342,187 @@ class ComwareDriver(NetworkDriver):
                 hop_results[hop_index] = {"probes": probes}
 
         return {"success": hop_results} if hop_results else {"error": output.strip() or "Traceroute command failed"}
+
+    def get_bgp_neighbors(self) -> Dict[str, models.BGPStateNeighborsPerVRFDict]:
+        output = self.send_command("display bgp peer")
+        if not output.strip():
+            return {}
+
+        router_id_match = re.search(r"BGP local router ID\s*:\s*(?P<router_id>\S+)", output, re.I)
+        local_as_match = re.search(r"Local AS number\s*:\s*(?P<local_as>\d+)", output, re.I)
+        local_as = int(local_as_match.group("local_as")) if local_as_match else 0
+
+        result: Dict[str, models.BGPStateNeighborsPerVRFDict] = {
+            "global": {"router_id": router_id_match.group("router_id") if router_id_match else "", "peers": {}}
+        }
+
+        peer_pattern = re.compile(
+            r"^(?P<peer>\S+)\s+"
+            r"(?P<remote_as>\d+)\s+"
+            r"(?P<msg_rcvd>\d+)\s+"
+            r"(?P<msg_sent>\d+)\s+"
+            r"\d+\s+\d+\s+\d+\s+"
+            r"(?P<uptime>\S+)\s+"
+            r"(?P<state>\S+)\s*$",
+            re.M,
+        )
+
+        for match in peer_pattern.finditer(output):
+            peer_ip = match.group("peer")
+            state_field = match.group("state")
+            state_name, _, prefix_count = state_field.partition("/")
+            is_up = state_name.lower() == "established"
+            is_enabled = "admin" not in state_name.lower()
+            received_prefixes = int(prefix_count) if prefix_count.isdigit() else 0
+            sent_prefixes = 0
+            remote_id = ""
+            description = ""
+
+            try:
+                peer_detail = self.send_command(f"display bgp peer {peer_ip}")
+            except Exception:
+                peer_detail = ""
+
+            remote_id_match = re.search(r"remote router ID\s+(?P<remote_id>\S+)", peer_detail, re.I)
+            if remote_id_match:
+                remote_id = remote_id_match.group("remote_id")
+
+            description_match = re.search(
+                r"Peer'?s description\s*:\s*\"?(?P<description>.+?)\"?\s*$", peer_detail, re.M
+            )
+            if description_match:
+                description = description_match.group("description").strip()
+
+            sent_prefix_match = re.search(
+                r"Advertised(?: total)? routes\s*:\s*(?P<count>\d+)|Sent prefixes\s*:\s*(?P<sent>\d+)",
+                peer_detail,
+                re.I,
+            )
+            if sent_prefix_match:
+                sent_prefixes = int(sent_prefix_match.group("count") or sent_prefix_match.group("sent") or 0)
+
+            address_family = "ipv6 unicast" if ":" in peer_ip else "ipv4 unicast"
+            result["global"]["peers"][peer_ip] = {
+                "local_as": local_as,
+                "remote_as": int(match.group("remote_as")),
+                "remote_id": remote_id,
+                "is_up": is_up,
+                "is_enabled": is_enabled,
+                "description": description,
+                "uptime": _parse_elapsed_time(match.group("uptime")),
+                "address_family": {
+                    address_family: {
+                        "received_prefixes": received_prefixes,
+                        "accepted_prefixes": received_prefixes,
+                        "sent_prefixes": sent_prefixes,
+                    }
+                },
+            }
+
+        return result
+
+    def get_route_to(
+        self, destination: str = "", protocol: str = "", longer: bool = False
+    ) -> Dict[str, List[models.RouteDict]]:
+        if longer:
+            raise NotImplementedError("longer route lookup is not supported on Comware yet")
+        if not destination:
+            return {}
+        if ":" in destination:
+            raise NotImplementedError("IPv6 route lookup is not supported on Comware yet")
+
+        output = self.send_command(f"display ip routing-table {destination} verbose")
+        if not output.strip():
+            return {}
+
+        routing_table_match = re.search(r"Routing Table[s]?\s*:\s*(?P<table>\S+)", output, re.I)
+        routing_table = (
+            _normalize_routing_table_name(routing_table_match.group("table")) if routing_table_match else "global"
+        )
+        routes: Dict[str, List[models.RouteDict]] = {}
+        protocol_filter = protocol.strip().lower()
+
+        table_pattern = re.compile(
+            r"^(?P<prefix>\d{1,3}(?:\.\d{1,3}){3}(?:/\d+)?)(?:\s+(?P<mask>\d{1,3}(?:\.\d{1,3}){3}))?\s+"
+            r"(?P<protocol>\S+)\s+"
+            r"(?P<preference>\d+)\s+"
+            r"(?P<cost>\d+)\s+"
+            r"(?P<flags>[A-Z-]+)\s+"
+            r"(?P<next_hop>\S+)\s+"
+            r"(?P<interface>\S+)"
+            r"(?:\s+(?P<age>\S+))?\s*$",
+            re.M,
+        )
+
+        for match in table_pattern.finditer(output):
+            prefix = match.group("prefix")
+            if "/" not in prefix:
+                mask = match.group("mask")
+                if not mask:
+                    continue
+                prefix = f"{prefix}/{ipaddress.IPv4Network(f'0.0.0.0/{mask}').prefixlen}"
+
+            route_protocol = match.group("protocol")
+            if protocol_filter and route_protocol.lower() != protocol_filter:
+                continue
+
+            route: models.RouteDict = {
+                "protocol": route_protocol.upper(),
+                "current_active": True,
+                "last_active": False,
+                "age": _parse_elapsed_time(match.group("age") or ""),
+                "next_hop": match.group("next_hop"),
+                "outgoing_interface": _normalize_outgoing_interface(match.group("interface")),
+                "selected_next_hop": "R" not in match.group("flags"),
+                "preference": int(match.group("preference")),
+                "inactive_reason": "",
+                "routing_table": routing_table,
+                "protocol_attributes": {"metric": int(match.group("cost"))},
+            }
+            routes.setdefault(prefix, []).append(route)
+
+        if routes:
+            return routes
+
+        for block in re.split(r"\n\s*\n", output):
+            destination_match = re.search(r"Destination:\s*(?P<prefix>\S+)", block, re.I)
+            protocol_match = re.search(r"Protocol\s*:\s*(?P<protocol>\S+)", block, re.I)
+            preference_match = re.search(r"Preference\s*:\s*(?P<preference>\d+)", block, re.I)
+            cost_match = re.search(r"Cost\s*:\s*(?P<cost>\d+)", block, re.I)
+            next_hop_match = re.search(r"NextHop\s*:\s*(?P<next_hop>\S+)", block, re.I)
+            interface_match = re.search(r"(?:Interface|Output interface)\s*:\s*(?P<interface>\S+)", block, re.I)
+            age_match = re.search(r"Age\s*:\s*(?P<age>\S+)", block, re.I)
+
+            if (
+                destination_match is None
+                or protocol_match is None
+                or preference_match is None
+                or cost_match is None
+                or next_hop_match is None
+                or interface_match is None
+            ):
+                continue
+            route_protocol = protocol_match.group("protocol")
+            if protocol_filter and route_protocol.lower() != protocol_filter:
+                continue
+
+            prefix = destination_match.group("prefix")
+            route = {
+                "protocol": route_protocol.upper(),
+                "current_active": True,
+                "last_active": False,
+                "age": _parse_elapsed_time(age_match.group("age")) if age_match else 0,
+                "next_hop": next_hop_match.group("next_hop"),
+                "outgoing_interface": _normalize_outgoing_interface(interface_match.group("interface")),
+                "selected_next_hop": True,
+                "preference": int(preference_match.group("preference")),
+                "inactive_reason": "",
+                "routing_table": routing_table,
+                "protocol_attributes": {"metric": int(cost_match.group("cost"))},
+            }
+            routes.setdefault(prefix, []).append(route)
+
+        return routes
 
     def _get_structured_output(self, command: str, template_name: Optional[str] = None) -> StructuredOutput:
         if template_name is None:
@@ -1135,18 +1382,27 @@ class ComwareDriver(NetworkDriver):
         if not self._candidate_config.strip():
             return ""
 
-        if not self._replace_candidate:
-            raise MergeConfigException("compare_config is only supported for replace candidates on Comware")
-
         running_config = self.get_config(retrieve="running")["running"]
-        diff = difflib.unified_diff(
-            running_config.splitlines(),
-            self._candidate_config.splitlines(),
-            fromfile="running-config",
-            tofile="candidate-config",
-            lineterm="",
-        )
-        return "\n".join(diff)
+        running_lines = set(running_config.splitlines())
+
+        if self._replace_candidate:
+            diff = difflib.unified_diff(
+                running_config.splitlines(),
+                self._candidate_config.splitlines(),
+                fromfile="running-config",
+                tofile="candidate-config",
+                lineterm="",
+            )
+            return "\n".join(diff)
+
+        added_lines = [
+            line
+            for line in self._candidate_config.splitlines()
+            if line.strip() and line.strip() not in ("#", "return") and line not in running_lines
+        ]
+        if not added_lines:
+            return "No changes to commit."
+        return "The following lines will be added:\n" + "\n".join(added_lines)
 
     def discard_config(self) -> None:
         self._candidate_config = ""
@@ -1160,7 +1416,7 @@ class ComwareDriver(NetworkDriver):
         if not self._candidate_config.strip():
             return
         if self._replace_candidate:
-            raise ReplaceConfigException("Replace commit is not supported on Comware yet")
+            raise ReplaceConfigException("Comware replace commit is not yet supported")
 
         commands = [
             line.strip()
@@ -1171,14 +1427,80 @@ class ComwareDriver(NetworkDriver):
             self.discard_config()
             return
 
+        backup_file = self._BACKUP_CONFIG_FILES[1] if self._replace_candidate else self._BACKUP_CONFIG_FILES[0]
+        try:
+            backup_output = self.send_command(f"save force {backup_file} safely")
+            if _has_cli_error(backup_output):
+                logger.warning(f"Failed to save pre-commit backup to {backup_file}: {backup_output.strip()}")
+            else:
+                self._last_backup_file = backup_file
+        except Exception:
+            logger.warning(f"Failed to save pre-commit backup to {backup_file}, proceeding anyway")
+
         device = cast(HPComwareBase, self.device)
         try:
             device.send_config_set(commands)
             self.send_command("save force")
         except Exception as exc:
-            raise CommitError("Failed to commit merge candidate on Comware") from exc
+            raise CommitError("Failed to commit candidate config on Comware") from exc
 
         self.discard_config()
+
+    def rollback(self) -> None:
+        cast(HPComwareBase, self.device)
+        backup_files = self._get_backup_files_for_rollback()
+
+        for backup_file in backup_files:
+            for command in (
+                f"rollback configuration to file {backup_file}",
+                f"configuration replace file flash:/{backup_file}",
+            ):
+                try:
+                    rollback_output = self.send_command(command)
+                except Exception:
+                    continue
+                if _has_cli_error(rollback_output):
+                    continue
+
+                save_output = self.send_command("save force")
+                if _has_cli_error(save_output):
+                    raise ReplaceConfigException("Rollback restored config but failed to save it")
+
+                self._last_backup_file = backup_file
+                self.discard_config()
+                return
+        raise ReplaceConfigException("Rollback failed: no backup config found on flash")
+
+    def _get_backup_files_for_rollback(self) -> List[str]:
+        directory_output = ""
+        for command in ("dir flash:", "display directory flash:"):
+            try:
+                response = self.send_command(command)
+            except Exception:
+                continue
+            if _has_cli_error(response):
+                continue
+            directory_output = response
+            break
+
+        if directory_output:
+            timestamps = _parse_directory_timestamps(directory_output, list(self._BACKUP_CONFIG_FILES))
+            if timestamps:
+                ranked_files = sorted(
+                    self._BACKUP_CONFIG_FILES,
+                    key=lambda file: (
+                        timestamps.get(file, -1),
+                        1 if file == self._last_backup_file else 0,
+                    ),
+                    reverse=True,
+                )
+                return list(ranked_files)
+
+        backup_files: List[str] = []
+        if self._last_backup_file:
+            backup_files.append(self._last_backup_file)
+        backup_files.extend(file for file in self._BACKUP_CONFIG_FILES if file not in backup_files)
+        return backup_files
 
     def get_ntp_peers(self) -> Dict[str, models.NTPPeerDict]:
         ntp_peers: Dict[str, models.NTPPeerDict] = {}

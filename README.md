@@ -14,12 +14,14 @@ NAPALM driver for H3C Comware
 - [x] get_lldp_neighbors
 - [x] get_lldp_neighbors_detail
 - [x] get_mac_address_table
+- [x] get_bgp_neighbors
 - [x] get_network_instances
 - [x] get_ntp_peers
 - [x] get_ntp_servers
 - [x] get_ntp_stats
 - [x] get_snmp_information
 - [x] get_users
+- [x] get_route_to (IPv4 exact-match only)
 - [x] get_interfaces_counters
 - [x] get_ipv6_neighbors_table
 - [x] get_vlans
@@ -28,6 +30,7 @@ NAPALM driver for H3C Comware
 - [x] compare_config
 - [x] commit_config (merge only)
 - [x] discard_config
+- [x] rollback
 - [x] ping
 - [x] traceroute
 

@@ -42,8 +42,9 @@ class TestConfigWorkflow:
         device.load_merge_candidate(config="ntp-service server 1.1.1.1\n")
         assert device.get_config(retrieve="candidate")["candidate"] == "ntp-service server 1.1.1.1\n"
 
-        with pytest.raises(Exception, match="only supported for replace candidates"):
-            device.compare_config()
+        device.send_command = MagicMock(return_value="sysname current-sw\n#\n")
+        diff = device.compare_config()
+        assert "ntp-service server 1.1.1.1" in diff
 
     def test_load_replace_candidate_from_file(self, device, tmp_path: Path):
         candidate_file = tmp_path / "candidate.cfg"
@@ -85,14 +86,17 @@ class TestConfigWorkflow:
         device.commit_config()
 
         device.device.send_config_set.assert_called_once_with(["interface LoopBack1", "ip address 10.0.0.1 32"])
-        device.send_command.assert_called_once_with("save force")
+        device.send_command.assert_any_call("save force backup-before-merge.cfg safely")
+        device.send_command.assert_any_call("save force")
         assert device.get_config(retrieve="candidate")["candidate"] == ""
 
     def test_commit_config_rejects_replace_candidate(self, device):
         device.load_replace_candidate(config="sysname replacement-sw\n")
 
-        with pytest.raises(Exception, match="Replace commit is not supported"):
+        with pytest.raises(Exception, match="replace commit is not yet supported"):
             device.commit_config()
+
+        assert device.get_config(retrieve="candidate")["candidate"] == "sysname replacement-sw\n"
 
     def test_commit_config_rejects_commit_message_and_revert_timer(self, device):
         with pytest.raises(NotImplementedError, match="commit messages"):
@@ -100,6 +104,133 @@ class TestConfigWorkflow:
 
         with pytest.raises(NotImplementedError, match="revert timers"):
             device.commit_config(revert_in=300)
+
+    def test_rollback_from_merge_backup(self, device):
+        calls = []
+
+        def side_effect(cmd):
+            calls.append(cmd)
+            if cmd == "rollback configuration to file backup-before-merge.cfg":
+                return "Configuration is saved."
+            if cmd == "save force":
+                return "Configuration is saved."
+            raise Exception("not found")
+
+        device.send_command = MagicMock(side_effect=side_effect)
+        device.rollback()
+
+        assert "rollback configuration to file backup-before-merge.cfg" in calls
+        assert calls[-1] == "save force"
+
+    def test_rollback_fallback_to_replace_backup(self, device):
+        calls = []
+
+        def side_effect(cmd):
+            calls.append(cmd)
+            if "backup-before-merge" in cmd:
+                raise Exception("not found")
+            if cmd == "rollback configuration to file backup-before-replace.cfg":
+                return "Configuration is saved."
+            return "Configuration is saved."
+
+        device.send_command = MagicMock(side_effect=side_effect)
+        device.rollback()
+
+        assert "rollback configuration to file backup-before-replace.cfg" in calls
+        assert calls[-1] == "save force"
+
+    def test_rollback_prefers_most_recent_backup(self, device):
+        device._last_backup_file = "backup-before-replace.cfg"
+        calls = []
+
+        def rollback_side_effect(cmd):
+            calls.append(cmd)
+            if cmd in {"dir flash:", "display directory flash:"}:
+                raise Exception("not supported")
+            if cmd == "rollback configuration to file backup-before-replace.cfg":
+                return "Configuration is saved."
+            if cmd == "save force":
+                return "Configuration is saved."
+            raise Exception("not found")
+
+        device.send_command = MagicMock(side_effect=rollback_side_effect)
+        device.rollback()
+
+        assert calls[2] == "rollback configuration to file backup-before-replace.cfg"
+        assert "rollback configuration to file backup-before-merge.cfg" not in calls
+
+    def test_rollback_prefers_newest_backup_from_directory_listing(self, device):
+        calls = []
+
+        def side_effect(cmd):
+            calls.append(cmd)
+            if cmd == "dir flash:":
+                return (
+                    "Directory of flash:/\n"
+                    "  14   -rw-         9400  Oct 01 2023 14:54:32   backup-before-merge.cfg\n"
+                    "  15   -rw-         9400  Oct 01 2023 14:55:32   backup-before-replace.cfg\n"
+                )
+            if cmd == "rollback configuration to file backup-before-replace.cfg":
+                return "Configuration is saved."
+            if cmd == "save force":
+                return "Configuration is saved."
+            raise Exception("not found")
+
+        device.send_command = MagicMock(side_effect=side_effect)
+        device.rollback()
+
+        assert calls[:2] == ["dir flash:", "rollback configuration to file backup-before-replace.cfg"]
+        assert "rollback configuration to file backup-before-merge.cfg" not in calls
+
+    def test_rollback_falls_back_to_legacy_replace_command(self, device):
+        calls = []
+
+        def side_effect(cmd):
+            calls.append(cmd)
+            if cmd == "configuration replace file flash:/backup-before-merge.cfg":
+                return "Configuration is saved."
+            if cmd == "save force":
+                return "Configuration is saved."
+            raise Exception("not found")
+
+        device.send_command = MagicMock(side_effect=side_effect)
+        device.rollback()
+
+        assert calls[:4] == [
+            "dir flash:",
+            "display directory flash:",
+            "rollback configuration to file backup-before-merge.cfg",
+            "configuration replace file flash:/backup-before-merge.cfg",
+        ]
+        assert calls[-1] == "save force"
+
+    def test_rollback_treats_cli_error_text_as_failure(self, device):
+        calls = []
+
+        def side_effect(cmd):
+            calls.append(cmd)
+            if cmd == "rollback configuration to file backup-before-merge.cfg":
+                return "Error: File does not exist."
+            if cmd == "configuration replace file flash:/backup-before-merge.cfg":
+                return "Configuration is saved."
+            if cmd == "save force":
+                return "Configuration is saved."
+            raise Exception("not found")
+
+        device.send_command = MagicMock(side_effect=side_effect)
+        device.rollback()
+
+        assert calls[:4] == [
+            "dir flash:",
+            "display directory flash:",
+            "rollback configuration to file backup-before-merge.cfg",
+            "configuration replace file flash:/backup-before-merge.cfg",
+        ]
+
+    def test_rollback_fails_when_no_backup(self, device):
+        device.send_command = MagicMock(side_effect=Exception("not found"))
+        with pytest.raises(Exception, match="no backup config found"):
+            device.rollback()
 
 
 class TestRunningConfigParsers:
@@ -336,6 +467,116 @@ class TestOperationalParsers:
                 "moves": 7,
             }
         ]
+
+    def test_get_bgp_neighbors(self, device):
+        device.send_command = MagicMock(
+            side_effect=[
+                (
+                    "BGP local router ID : 10.1.1.1\n"
+                    "Local AS number : 65001\n"
+                    "Total number of peers : 2                 Peers in Established state : 1\n"
+                    "Peer        Remote-AS MsgRcvd MsgSent  TblVer  InQ  OutQ Up/Down       State/PfxRcd\n"
+                    "2.2.2.2     65002     12345   12344    32      0    0    00:35:27      Established/10\n"
+                    "3.3.3.3     65003     0       0        0       0    0    00:00:12      Idle(Admin)\n"
+                ),
+                (
+                    "BGP peer is 2.2.2.2, remote AS 65002\n"
+                    " BGP version 4, remote router ID 2.2.2.22\n"
+                    ' Peer\'s description: "upstream-a"\n'
+                    " Advertised total routes: 7\n"
+                ),
+                "BGP version 4, remote router ID 3.3.3.33\n",
+            ]
+        )
+
+        result = device.get_bgp_neighbors()
+
+        assert result["global"]["router_id"] == "10.1.1.1"
+        assert result["global"]["peers"]["2.2.2.2"] == {
+            "local_as": 65001,
+            "remote_as": 65002,
+            "remote_id": "2.2.2.22",
+            "is_up": True,
+            "is_enabled": True,
+            "description": "upstream-a",
+            "uptime": 2127,
+            "address_family": {
+                "ipv4 unicast": {
+                    "received_prefixes": 10,
+                    "accepted_prefixes": 10,
+                    "sent_prefixes": 7,
+                }
+            },
+        }
+        assert result["global"]["peers"]["3.3.3.3"]["is_enabled"] is False
+        assert result["global"]["peers"]["3.3.3.3"]["address_family"]["ipv4 unicast"]["received_prefixes"] == 0
+
+    def test_get_route_to_from_table_output(self, device):
+        device.send_command = MagicMock(
+            return_value=(
+                "Routing Table : _public_\n"
+                "Destination/Mask Proto Pre Cost Flags NextHop Interface Age\n"
+                "10.1.2.0/24 OSPF 10 20 D 10.1.1.3 GigabitEthernet1/0/2 1d2h\n"
+                "10.1.2.0/24 Static 60 0 RD 10.1.1.4 GigabitEthernet1/0/3 2h23m\n"
+            )
+        )
+
+        result = device.get_route_to("10.1.2.0/24")
+
+        assert result["10.1.2.0/24"][0] == {
+            "protocol": "OSPF",
+            "current_active": True,
+            "last_active": False,
+            "age": 93600,
+            "next_hop": "10.1.1.3",
+            "outgoing_interface": "GigabitEthernet1/0/2",
+            "selected_next_hop": True,
+            "preference": 10,
+            "inactive_reason": "",
+            "routing_table": "global",
+            "protocol_attributes": {"metric": 20},
+        }
+        assert result["10.1.2.0/24"][1]["protocol"] == "STATIC"
+        assert result["10.1.2.0/24"][1]["selected_next_hop"] is False
+
+    def test_get_route_to_protocol_filter_and_verbose_fallback(self, device):
+        device.send_command = MagicMock(
+            return_value=(
+                "Routing Tables : Public\n"
+                "\n"
+                "Destination: 10.10.10.0/24\n"
+                "Protocol : BGP        Preference : 255         Cost : 0\n"
+                "NextHop  : 2.2.2.2    Interface: GigabitEthernet1/0/1\n"
+                "Age      : 01:34:12\n"
+            )
+        )
+
+        result = device.get_route_to("10.10.10.0/24", protocol="bgp")
+
+        assert result == {
+            "10.10.10.0/24": [
+                {
+                    "protocol": "BGP",
+                    "current_active": True,
+                    "last_active": False,
+                    "age": 5652,
+                    "next_hop": "2.2.2.2",
+                    "outgoing_interface": "GigabitEthernet1/0/1",
+                    "selected_next_hop": True,
+                    "preference": 255,
+                    "inactive_reason": "",
+                    "routing_table": "global",
+                    "protocol_attributes": {"metric": 0},
+                }
+            ]
+        }
+
+    def test_get_route_to_rejects_unsupported_modes(self, device):
+        with pytest.raises(NotImplementedError, match="longer route lookup"):
+            device.get_route_to("10.1.2.0/24", longer=True)
+
+        with pytest.raises(NotImplementedError, match="IPv6 route lookup"):
+            device.get_route_to("2001:db8::/64")
 
     def test_get_interfaces_counters(self, device):
         device.send_command = MagicMock(
