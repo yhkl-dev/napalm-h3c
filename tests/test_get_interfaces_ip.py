@@ -1,5 +1,3 @@
-from typing import Dict
-
 import pytest
 
 
@@ -55,5 +53,5 @@ class TestGetInterfacesIP:
         """Verify the return type matches the type hint"""
         device._get_structured_output.return_value = [{"interface": "Loopback0", "ip_address": ["10.1.1.1/32"]}]
         result = device.get_interfaces_ip()
-        assert isinstance(result, Dict)
+        assert isinstance(result, dict)
         assert all(isinstance(key, str) for key in result.keys())

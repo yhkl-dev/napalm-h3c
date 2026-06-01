@@ -1,5 +1,6 @@
 import re
 import time
+from typing import Any, Callable, List, Optional, TypeVar
 
 from napalm.base.helpers import canonical_interface_name
 
@@ -26,10 +27,12 @@ comware_interfaces = {
 }
 
 
-def canonical_interface_name_comware(interface):
-    return canonical_interface_name(
-        interface=interface,
-        addl_name_map=comware_interfaces,
+def canonical_interface_name_comware(interface: str) -> str:
+    return str(
+        canonical_interface_name(
+            interface=interface,
+            addl_name_map=comware_interfaces,
+        )
     )
 
 
@@ -54,7 +57,7 @@ def parse_time(time_str: str) -> int:
     return time_sec
 
 
-def parse_null(value, default, func=None, *args, **kwargs):
+def parse_null(value: Any, default: Any, func: Optional[Callable[..., Any]] = None, *args: Any, **kwargs: Any) -> Any:
     if value == "":
         return default
     if func:
@@ -62,13 +65,16 @@ def parse_null(value, default, func=None, *args, **kwargs):
     return value
 
 
-def strptime(time_str):
-    timeArray = time.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-    timestamp = time.mktime(timeArray)
-    return timestamp
+def strptime(time_str: str) -> float:
+    time_array = time.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+    timestamp = time.mktime(time_array)
+    return float(timestamp)
 
 
-def get_value_from_list_of_dict(_list, dict_key, func_max_or_min):
+T = TypeVar("T")
+
+
+def get_value_from_list_of_dict(_list: List[dict], dict_key: str, func_max_or_min: Callable[..., T]) -> dict:
     all_item = []
     for _dict in _list:
         all_item.append(_dict.get(dict_key))

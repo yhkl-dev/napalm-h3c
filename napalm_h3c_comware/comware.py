@@ -1,30 +1,33 @@
+# pyright: reportMissingTypeStubs=false
+
+import difflib
+import ipaddress
 import logging
+import re
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from operator import itemgetter
-from typing import Any, DefaultDict, Dict, List, Literal, Optional, Union, cast
+from pathlib import Path
+from types import TracebackType
+from typing import Any, Dict, List, Literal, Optional, Type, Union, cast
 
+import napalm.base.helpers as napalm_helpers
+import napalm.base.netmiko_helpers as napalm_netmiko_helpers
 from napalm.base import models
 from napalm.base.base import NetworkDriver
-from napalm.base.exceptions import CommandErrorException
-from napalm.base.helpers import (
-    mac,
-    textfsm_extractor,
-)
-from napalm.base.netmiko_helpers import netmiko_args
-from netaddr import EUI
+from napalm.base.exceptions import CommandErrorException, CommitError, MergeConfigException, ReplaceConfigException
+from napalm.base.helpers import mac
 from netmiko.hp.hp_comware import HPComwareBase
 
 from .types import (
     ArpEntry,
     CompactMemory,
-    CpuDict,
     DeviceManuinfoItem,
     EnvironmentDict,
     FanDict,
-    FanInfo,
     IrfConfigDict,
     IrfPortConfig,
     MACAddress,
@@ -34,66 +37,554 @@ from .types import (
     PowerDict,
     SerialNumber,
     TemperatureDict,
-    TemperatureInfo,
     VerboseCpuInfo,
     VersionInfo,
 )
-from .utils.helpers import (
-    canonical_interface_name_comware,
-    parse_time,
-    strptime,
-)
+from .utils.helpers import canonical_interface_name_comware, parse_time, strptime
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+StructuredRow = Dict[str, Any]
+StructuredOutput = List[StructuredRow]
+
+
+def _safe_get(data: Optional[Dict[str, Any]], key: str, default: Union[str, float] = "") -> Union[str, float]:
+    if not data or key not in data:
+        return default
+    return data[key] if data[key] is not None else default
+
+
+def _as_str_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in cast(List[Any], value)]
+    return [str(value)]
+
+
+def _parse_number(value: str) -> Union[int, float]:
+    return float(value) if "." in value else int(value)
+
+
+def _parse_elapsed_time(value: str) -> int:
+    normalized = value.strip().lower()
+    if not normalized or normalized in {"--", "never", "none"}:
+        return 0
+    if re.fullmatch(r"\d+:\d{2}:\d{2}", normalized):
+        hours, minutes, seconds = (int(part) for part in normalized.split(":"))
+        return (hours * 3600) + (minutes * 60) + seconds
+    if re.fullmatch(r"\d+:\d{2}", normalized):
+        minutes, seconds = (int(part) for part in normalized.split(":"))
+        return (minutes * 60) + seconds
+
+    units = {"y": 365 * 24 * 3600, "w": 7 * 24 * 3600, "d": 24 * 3600, "h": 3600, "m": 60, "s": 1}
+    matches = re.findall(r"(\d+)\s*([ywdhms])", normalized)
+    if matches:
+        return sum(int(amount) * units[unit] for amount, unit in matches)
+    if normalized.isdigit():
+        return int(normalized)
+    return 0
+
+
+def _normalize_routing_table_name(name: str) -> str:
+    normalized = name.strip()
+    if normalized.lower() in {"_public_", "public", "default"}:
+        return "global"
+    return normalized
+
+
+def _normalize_outgoing_interface(name: str) -> str:
+    return canonical_interface_name_comware(name) if name and name not in {"NULLO", "-"} else name
+
+
+def _has_cli_error(output: str) -> bool:
+    normalized = output.strip().lower()
+    if not normalized:
+        return False
+    error_markers = (
+        "error:",
+        "failed",
+        "not found",
+        "cannot ",
+        "can't ",
+        "invalid",
+        "incomplete command",
+        "ambiguous command",
+        "wrong parameter",
+        "no such file",
+    )
+    return normalized.startswith("%") or any(marker in normalized for marker in error_markers) or "\n ^" in normalized
+
+
+def _parse_directory_timestamps(output: str, target_files: List[str]) -> Dict[str, int]:
+    file_timestamps: Dict[str, int] = {}
+    target_names = set(target_files)
+    pattern = re.compile(
+        r"^\s*\d+\s+\S+\s+\S+\s+(?P<timestamp>[A-Z][a-z]{2}\s+\d{2}\s+\d{4}\s+\d{2}:\d{2}:\d{2})\s+(?P<name>\S+)\s*$"
+    )
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if match is None:
+            continue
+        name = match.group("name")
+        if name not in target_names:
+            continue
+        file_timestamps[name] = int(time.mktime(time.strptime(match.group("timestamp"), "%b %d %Y %H:%M:%S")))
+    return file_timestamps
+
+
+def _validate_cli_token(
+    value: str, field_name: str, *, allow_network: bool = False, allow_hostname: bool = False
+) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} cannot be empty")
+    if re.search(r"[\s\x00-\x1f\x7f]", normalized):
+        raise ValueError(f"Invalid {field_name}: whitespace and control characters are not allowed")
+
+    try:
+        if allow_network:
+            ipaddress.ip_network(normalized, strict=False)
+        else:
+            ipaddress.ip_address(normalized)
+        return normalized
+    except ValueError:
+        if allow_hostname and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,253}[A-Za-z0-9])?", normalized):
+            return normalized
+        raise ValueError(f"Invalid {field_name}: {value}")
+
+
+def _validate_int_argument(value: Any, field_name: str, *, minimum: int = 1, maximum: Optional[int] = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Invalid {field_name}: {value}")
+    validated_value = cast(int, value)
+    if validated_value < minimum:
+        raise ValueError(f"Invalid {field_name}: {value}")
+    if maximum is not None and validated_value > maximum:
+        raise ValueError(f"Invalid {field_name}: {value}")
+    return validated_value
 
 
 class ComwareDriver(NetworkDriver):
+    _DEFAULT_VLAN_PREFIX = "VLAN "
+    _BACKUP_CONFIG_FILES = ("backup-before-merge.cfg", "backup-before-replace.cfg")
+
     def __init__(
-        self, hostname: str, username: str, password: str, timeout: int = 100, optional_args: Optional[Dict] = None
+        self,
+        hostname: str,
+        username: str,
+        password: str,
+        timeout: int = 100,
+        optional_args: Optional[Dict[str, Any]] = None,
     ):
-        self.device = None  # type: ignore
+        self.device: Optional[HPComwareBase] = None
         if optional_args is None:
             optional_args = {}
         self.hostname = hostname
         self.username = username
         self.password = password
         self.timeout = timeout
-        self.netmiko_optional_args = netmiko_args(optional_args)
+        self.netmiko_optional_args: Dict[str, Any] = cast(
+            Dict[str, Any], cast(Any, napalm_netmiko_helpers).netmiko_args(optional_args)
+        )
         self._env_cache: Optional[EnvironmentDict] = None
         self._cache_ttl = 30
-        self._last_update_time = 0
+        self._last_update_time = 0.0
+        self._candidate_config = ""
+        self._replace_candidate = False
+        self._last_backup_file: Optional[str] = None
+        self._device_lock = threading.Lock()
 
     def open(self) -> None:
         """Open a connection to the device."""
         device_type = "hp_comware"  # for H3C device, this must be hp_comware
-        self.device: HPComwareBase = self._netmiko_open(device_type, netmiko_optional_args=self.netmiko_optional_args)
+        netmiko_open = getattr(self, "_netmiko_open")
+        self.device = cast(HPComwareBase, netmiko_open(device_type, netmiko_optional_args=self.netmiko_optional_args))
 
     def close(self) -> None:
         self._netmiko_close()
 
-    def __enter__(self):
+    def __enter__(self) -> "ComwareDriver":
         self.open()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        _exc_type: Optional[Type[BaseException]],
+        _exc_val: Optional[BaseException],
+        _exc_tb: Optional[TracebackType],
+    ) -> None:
         self.close()
 
-    def send_command(self, command: str, *args, **kwargs) -> str | List[Any] | Dict[str, Any]:
-        return self.device.send_command(command, *args, **kwargs)
+    def send_command(self, command: str, *args: Any, **kwargs: Any) -> str:
+        with self._device_lock:
+            return str(cast(HPComwareBase, self.device).send_command(command, *args, **kwargs))
+
+    def send_config_set(self, config_commands: List[str], *args: Any, **kwargs: Any) -> str:
+        with self._device_lock:
+            return str(cast(HPComwareBase, self.device).send_config_set(config_commands, *args, **kwargs))
+
+    def find_prompt(self) -> str:
+        with self._device_lock:
+            return str(cast(HPComwareBase, self.device).find_prompt())
 
     def is_alive(self) -> models.AliveDict:
         try:
             return {"is_alive": False if self.device is None else getattr(self.device, "is_alive", lambda: False)()}
         except Exception as e:
-            logging.warning(f"Device alive check failed: {str(e)}")
+            logger.warning(f"Device alive check failed: {str(e)}")
             return {"is_alive": False}
 
-    def _get_structured_output(self, command: str, template_name: Optional[str] = None):
+    def ping(
+        self,
+        destination: str,
+        source: str = "",
+        ttl: int = 255,
+        timeout: int = 2,
+        size: int = 100,
+        count: int = 5,
+        vrf: str = "",
+        source_interface: str = "",
+    ) -> models.PingResultDict:
+        if vrf:
+            raise NotImplementedError("VRF-aware ping is not supported on Comware yet")
+        if source_interface:
+            raise NotImplementedError("source_interface ping is not supported on Comware yet")
+
+        validated_destination = _validate_cli_token(destination, "ping destination", allow_hostname=True)
+        validated_source = _validate_cli_token(source, "ping source") if source else ""
+        validated_timeout = _validate_int_argument(timeout, "ping timeout")
+        validated_size = _validate_int_argument(size, "ping size")
+        validated_count = _validate_int_argument(count, "ping count")
+        validated_ttl = _validate_int_argument(ttl, "ping ttl", maximum=255)
+
+        command = f"ping -t {validated_timeout * 1000} -s {validated_size} -c {validated_count}"
+        if validated_ttl != 255:
+            command += f" -h {validated_ttl}"
+        if validated_source:
+            command += f" -a {validated_source}"
+        command += f" {validated_destination}"
+
+        output = self.send_command(command)
+        if re.search(r"(?i)\berror\b|unknown host|unreachable", output):
+            return {"error": output.strip()}
+
+        sent_match = re.search(r"(\d+)\s+packet\(s\)\s+transmitted", output)
+        received_match = re.search(r"(\d+)\s+packet\(s\)\s+received", output)
+        if sent_match is None or received_match is None:
+            return {"error": output.strip() or "Ping command failed"}
+
+        probes_sent = int(sent_match.group(1))
+        probes_received = int(received_match.group(1))
+        result: models.PingDict = {
+            "probes_sent": probes_sent,
+            "packet_loss": (probes_sent - probes_received) / probes_sent * 100 if probes_sent > 0 else 0.0,
+            "rtt_min": 0.0,
+            "rtt_max": 0.0,
+            "rtt_avg": 0.0,
+            "rtt_stddev": 0.0,
+            "results": [],
+        }
+
+        stats_match = re.search(r"min/avg/max(?:/[a-z]+)?\s*=\s*([\d.]+)/([\d.]+)/([\d.]+)", output, re.I)
+        if stats_match:
+            result["rtt_min"] = float(stats_match.group(1))
+            result["rtt_avg"] = float(stats_match.group(2))
+            result["rtt_max"] = float(stats_match.group(3))
+
+        probe_results: List[models.PingResultDictEntry] = []
+        for ip_addr, operator, rtt_value in re.findall(
+            r"Reply from\s+(\S+):.*?time([=<])(\d+(?:\.\d+)?)", output, re.I
+        ):
+            rtt = float(rtt_value)
+            if operator == "<" and rtt == 1.0:
+                rtt = 1.0
+            probe_results.append({"ip_address": ip_addr, "rtt": rtt})
+
+        result["results"] = probe_results
+        return {"success": result}
+
+    def traceroute(
+        self,
+        destination: str,
+        source: str = "",
+        ttl: int = 255,
+        timeout: int = 2,
+        vrf: str = "",
+    ) -> models.TracerouteResultDict:
+        if vrf:
+            raise NotImplementedError("VRF-aware traceroute is not supported on Comware yet")
+
+        validated_destination = _validate_cli_token(destination, "traceroute destination", allow_hostname=True)
+        validated_source = _validate_cli_token(source, "traceroute source") if source else ""
+        validated_timeout = _validate_int_argument(timeout, "traceroute timeout")
+        validated_ttl = _validate_int_argument(ttl, "traceroute ttl", maximum=255)
+
+        command = f"tracert -m {validated_ttl} -w {validated_timeout * 1000}"
+        if validated_source:
+            command += f" -a {validated_source}"
+        command += f" {validated_destination}"
+
+        output = self.send_command(command)
+        if re.search(r"(?i)\berror\b|unknown host|unreachable", output):
+            return {"error": output.strip()}
+
+        hop_results: Dict[int, models.TracerouteResultDictEntry] = {}
+        hop_pattern = re.compile(r"^\s*(\d+)\s+(.+)$")
+        rtt_pattern = re.compile(r"(\d+(?:\.\d+)?)\s*ms", re.I)
+        ip_pattern = re.compile(r"^\(?([0-9a-f:.]+)\)?$", re.I)
+
+        for line in output.splitlines():
+            hop_match = hop_pattern.match(line)
+            if hop_match is None:
+                continue
+
+            hop_index = int(hop_match.group(1))
+            hop_body = hop_match.group(2)
+            probes: Dict[int, models.TracerouteDict] = {}
+            if re.match(r"^\*[\s*]*$", hop_body.strip()):
+                for probe_index in range(1, 4):
+                    probes[probe_index] = {"host_name": "*", "ip_address": "*", "rtt": -1.0}
+                hop_results[hop_index] = {"probes": probes}
+                continue
+
+            parse_pos = 0
+            last_host = ""
+            last_ip = ""
+            while len(probes) < 3:
+                remaining = hop_body[parse_pos:].lstrip()
+                if not remaining:
+                    break
+                if remaining.startswith("*"):
+                    probe_index = len(probes) + 1
+                    probes[probe_index] = {"host_name": "*", "ip_address": "*", "rtt": -1.0}
+                    parse_pos = len(hop_body) - len(remaining) + 1
+                    continue
+
+                rtt_match = rtt_pattern.search(hop_body, parse_pos)
+                if rtt_match is None:
+                    break
+
+                prefix = hop_body[parse_pos : rtt_match.start()].strip()
+                host_name = last_host
+                ip_address = last_ip
+                if prefix:
+                    prefix = prefix.strip("()")
+                    tokens = prefix.split()
+                    if tokens:
+                        candidate = tokens[-1].strip("()")
+                        if ip_pattern.match(candidate):
+                            ip_address = candidate
+                            host_name = " ".join(token.strip("()") for token in tokens[:-1]).strip() or ip_address
+                        else:
+                            host_name = " ".join(token.strip("()") for token in tokens)
+                            ip_address = host_name
+
+                if not host_name or not ip_address:
+                    break
+
+                probe_index = len(probes) + 1
+                probes[probe_index] = {
+                    "host_name": host_name,
+                    "ip_address": ip_address,
+                    "rtt": float(rtt_match.group(1)),
+                }
+                last_host = host_name
+                last_ip = ip_address
+                parse_pos = rtt_match.end()
+
+            if probes:
+                hop_results[hop_index] = {"probes": probes}
+
+        return {"success": hop_results} if hop_results else {"error": output.strip() or "Traceroute command failed"}
+
+    def get_bgp_neighbors(self) -> Dict[str, models.BGPStateNeighborsPerVRFDict]:
+        output = self.send_command("display bgp peer")
+        if not output.strip():
+            return {}
+
+        router_id_match = re.search(r"BGP local router ID\s*:\s*(?P<router_id>\S+)", output, re.I)
+        local_as_match = re.search(r"Local AS number\s*:\s*(?P<local_as>\d+)", output, re.I)
+        local_as = int(local_as_match.group("local_as")) if local_as_match else 0
+
+        result: Dict[str, models.BGPStateNeighborsPerVRFDict] = {
+            "global": {"router_id": router_id_match.group("router_id") if router_id_match else "", "peers": {}}
+        }
+
+        peer_pattern = re.compile(
+            r"^(?P<peer>\S+)\s+"
+            r"(?P<remote_as>\d+)\s+"
+            r"(?P<msg_rcvd>\d+)\s+"
+            r"(?P<msg_sent>\d+)\s+"
+            r"\d+\s+\d+\s+\d+\s+"
+            r"(?P<uptime>\S+)\s+"
+            r"(?P<state>\S+)\s*$",
+            re.M,
+        )
+
+        for match in peer_pattern.finditer(output):
+            peer_ip = match.group("peer")
+            state_field = match.group("state")
+            state_name, _, prefix_count = state_field.partition("/")
+            is_up = state_name.lower() == "established"
+            is_enabled = "admin" not in state_name.lower()
+            received_prefixes = int(prefix_count) if prefix_count.isdigit() else 0
+            sent_prefixes = 0
+            remote_id = ""
+            description = ""
+
+            try:
+                peer_detail = self.send_command(f"display bgp peer {peer_ip}")
+            except Exception:
+                peer_detail = ""
+
+            remote_id_match = re.search(r"remote router ID\s+(?P<remote_id>\S+)", peer_detail, re.I)
+            if remote_id_match:
+                remote_id = remote_id_match.group("remote_id")
+
+            description_match = re.search(
+                r"Peer'?s description\s*:\s*\"?(?P<description>.+?)\"?\s*$", peer_detail, re.M
+            )
+            if description_match:
+                description = description_match.group("description").strip()
+
+            sent_prefix_match = re.search(
+                r"Advertised(?: total)? routes\s*:\s*(?P<count>\d+)|Sent prefixes\s*:\s*(?P<sent>\d+)",
+                peer_detail,
+                re.I,
+            )
+            if sent_prefix_match:
+                sent_prefixes = int(sent_prefix_match.group("count") or sent_prefix_match.group("sent") or 0)
+
+            address_family = "ipv6 unicast" if ":" in peer_ip else "ipv4 unicast"
+            result["global"]["peers"][peer_ip] = {
+                "local_as": local_as,
+                "remote_as": int(match.group("remote_as")),
+                "remote_id": remote_id,
+                "is_up": is_up,
+                "is_enabled": is_enabled,
+                "description": description,
+                "uptime": _parse_elapsed_time(match.group("uptime")),
+                "address_family": {
+                    address_family: {
+                        "received_prefixes": received_prefixes,
+                        "accepted_prefixes": received_prefixes,
+                        "sent_prefixes": sent_prefixes,
+                    }
+                },
+            }
+
+        return result
+
+    def get_route_to(
+        self, destination: str = "", protocol: str = "", longer: bool = False
+    ) -> Dict[str, List[models.RouteDict]]:
+        if longer:
+            raise NotImplementedError("longer route lookup is not supported on Comware yet")
+        if not destination:
+            return {}
+        validated_destination = _validate_cli_token(destination, "route destination", allow_network=True)
+        if ":" in validated_destination:
+            raise NotImplementedError("IPv6 route lookup is not supported on Comware yet")
+
+        output = self.send_command(f"display ip routing-table {validated_destination} verbose")
+        if not output.strip():
+            return {}
+
+        routing_table_match = re.search(r"Routing Table[s]?\s*:\s*(?P<table>\S+)", output, re.I)
+        routing_table = (
+            _normalize_routing_table_name(routing_table_match.group("table")) if routing_table_match else "global"
+        )
+        routes: Dict[str, List[models.RouteDict]] = {}
+        protocol_filter = protocol.strip().lower()
+
+        table_pattern = re.compile(
+            r"^(?P<prefix>\d{1,3}(?:\.\d{1,3}){3}(?:/\d+)?)(?:\s+(?P<mask>\d{1,3}(?:\.\d{1,3}){3}))?\s+"
+            r"(?P<protocol>\S+)\s+"
+            r"(?P<preference>\d+)\s+"
+            r"(?P<cost>\d+)\s+"
+            r"(?P<flags>[A-Z-]+)\s+"
+            r"(?P<next_hop>\S+)\s+"
+            r"(?P<interface>\S+)"
+            r"(?:\s+(?P<age>\S+))?\s*$",
+            re.M,
+        )
+
+        for match in table_pattern.finditer(output):
+            prefix = match.group("prefix")
+            if "/" not in prefix:
+                mask = match.group("mask")
+                if not mask:
+                    continue
+                prefix = f"{prefix}/{ipaddress.IPv4Network(f'0.0.0.0/{mask}').prefixlen}"
+
+            route_protocol = match.group("protocol")
+            if protocol_filter and route_protocol.lower() != protocol_filter:
+                continue
+
+            route: models.RouteDict = {
+                "protocol": route_protocol.upper(),
+                "current_active": True,
+                "last_active": False,
+                "age": _parse_elapsed_time(match.group("age") or ""),
+                "next_hop": match.group("next_hop"),
+                "outgoing_interface": _normalize_outgoing_interface(match.group("interface")),
+                "selected_next_hop": "R" not in match.group("flags"),
+                "preference": int(match.group("preference")),
+                "inactive_reason": "",
+                "routing_table": routing_table,
+                "protocol_attributes": {"metric": int(match.group("cost"))},
+            }
+            routes.setdefault(prefix, []).append(route)
+
+        if routes:
+            return routes
+
+        for block in re.split(r"\n\s*\n", output):
+            destination_match = re.search(r"Destination:\s*(?P<prefix>\S+)", block, re.I)
+            protocol_match = re.search(r"Protocol\s*:\s*(?P<protocol>\S+)", block, re.I)
+            preference_match = re.search(r"Preference\s*:\s*(?P<preference>\d+)", block, re.I)
+            cost_match = re.search(r"Cost\s*:\s*(?P<cost>\d+)", block, re.I)
+            next_hop_match = re.search(r"NextHop\s*:\s*(?P<next_hop>\S+)", block, re.I)
+            interface_match = re.search(r"(?:Interface|Output interface)\s*:\s*(?P<interface>\S+)", block, re.I)
+            age_match = re.search(r"Age\s*:\s*(?P<age>\S+)", block, re.I)
+
+            if (
+                destination_match is None
+                or protocol_match is None
+                or preference_match is None
+                or cost_match is None
+                or next_hop_match is None
+                or interface_match is None
+            ):
+                continue
+            route_protocol = protocol_match.group("protocol")
+            if protocol_filter and route_protocol.lower() != protocol_filter:
+                continue
+
+            prefix = destination_match.group("prefix")
+            route = {
+                "protocol": route_protocol.upper(),
+                "current_active": True,
+                "last_active": False,
+                "age": _parse_elapsed_time(age_match.group("age")) if age_match else 0,
+                "next_hop": next_hop_match.group("next_hop"),
+                "outgoing_interface": _normalize_outgoing_interface(interface_match.group("interface")),
+                "selected_next_hop": True,
+                "preference": int(preference_match.group("preference")),
+                "inactive_reason": "",
+                "routing_table": routing_table,
+                "protocol_attributes": {"metric": int(cost_match.group("cost"))},
+            }
+            routes.setdefault(prefix, []).append(route)
+
+        return routes
+
+    def _get_structured_output(self, command: str, template_name: Optional[str] = None) -> StructuredOutput:
         if template_name is None:
             template_name = "_".join(command.split())
         raw_output = self.send_command(command)
-        result = textfsm_extractor(self, template_name, raw_output)  # type: ignore
-        return result
+        return cast(StructuredOutput, cast(Any, napalm_helpers).textfsm_extractor(self, template_name, raw_output))
 
     def get_facts(self) -> models.FactsDict:
         """
@@ -122,24 +613,19 @@ class ComwareDriver(NetworkDriver):
 
         """
 
-        def _safe_get(data: Optional[Dict], key: str, default: Union[str, float] = "") -> Union[str, float]:
-            """Safe dictionary value extraction with type preservation."""
-            if not data or key not in data:
-                return default
-            return data[key] if data[key] is not None else default
-
         try:
-            version = self._get_version() or {}
-            hostname = self.device.find_prompt()[1:-1]
+            version = cast(Dict[str, Any], self._get_version()) or {}
+            hostname = self.find_prompt()[1:-1]
             manuinfo = self._get_device_manuinfo() or []
             interfaces = self.get_interfaces() or {}
         except Exception as e:
             raise ValueError(f"Data collection failed: {str(e)}") from e
 
-        serials = []
+        serials: List[str] = []
         for item in manuinfo:
-            if isinstance(item, dict) and "serial_number" in item:
-                sn = str(item["serial_number"]).strip()
+            serial_number = item.get("serial_number")
+            if serial_number:
+                sn = str(serial_number).strip()
                 if sn:
                     serials.append(sn)
 
@@ -156,14 +642,6 @@ class ComwareDriver(NetworkDriver):
             "interface_list": interface_list,
         }
 
-    def _get_dns_host(self) -> List[Dict[str, Any]]:
-        """
-        This model's fpdn cannot be got.
-        """
-        cmd = "display dns host"
-        structured_output = self._get_structured_output(cmd)
-        return structured_output
-
     def _get_version(self) -> Optional[VersionInfo]:
         """
         Get device version information including OS version, vendor, uptime and model.
@@ -179,10 +657,10 @@ class ComwareDriver(NetworkDriver):
         cmd = "display version"
         structured_output = self._get_structured_output(cmd)
 
-        logging.debug(f"Structured version info: {structured_output}")
+        logger.debug(f"Structured version info: {structured_output}")
 
-        if not isinstance(structured_output, list) or len(structured_output) != 1:
-            logging.error(f"Unexpected version output format: {structured_output}")
+        if len(structured_output) != 1:
+            logger.error(f"Unexpected version output format: {structured_output}")
             return None
 
         try:
@@ -198,23 +676,23 @@ class ComwareDriver(NetworkDriver):
             return {"os_version": os_version, "vendor": vendor, "uptime": uptime, "model": model}
 
         except (KeyError, ValueError, TypeError) as e:
-            logging.error(f"Failed to parse version info: {str(e)}")
+            logger.error(f"Failed to parse version info: {str(e)}")
             return None
 
     def _get_device_manuinfo(self) -> List[DeviceManuinfoItem]:
         cmd = "display device manuinfo"
         structured_output = self._get_structured_output(cmd)
-        result = []
+        result: List[DeviceManuinfoItem] = []
         for item in structured_output:
-            normalized = {
+            normalized: DeviceManuinfoItem = {
                 "chassis_id": item.get("chassis_id", ""),
-                "slot_type": item["slot_type"],
-                "slot_id": item["slot_id"],
-                "device_name": item["device_name"] or None,
-                "serial_number": SerialNumber(item["serial_number"]) if item["serial_number"] else None,
-                "manufacturing_date": item["manufacturing_date"],
-                "vendor_name": item["vendor_name"] or None,
-                "mac_address": MACAddress(item["mac_address"]) if item["mac_address"] else None,
+                "slot_type": cast(Literal["Slot", "Fan", "Power"], item["slot_type"]),
+                "slot_id": str(item["slot_id"]),
+                "device_name": str(item["device_name"]) if item.get("device_name") else None,
+                "serial_number": SerialNumber(str(item["serial_number"])) if item.get("serial_number") else None,
+                "manufacturing_date": str(item["manufacturing_date"]) if item.get("manufacturing_date") else None,
+                "vendor_name": str(item["vendor_name"]) if item.get("vendor_name") else None,
+                "mac_address": MACAddress(str(item["mac_address"])) if item.get("mac_address") else None,
             }
             result.append(normalized)
         return result
@@ -227,7 +705,7 @@ class ComwareDriver(NetworkDriver):
 
         for interface in structured_int_info:
             try:
-                interface_name = interface.get("interface", "")
+                interface_name = str(interface.get("interface", ""))
                 if not interface_name:
                     continue
 
@@ -245,18 +723,54 @@ class ComwareDriver(NetworkDriver):
                 interface_dict[interface_name] = interface_data
 
             except Exception as e:
-                logging.warning(f"Error processing interface {interface.get('interface')}: {e}")
+                logger.warning(f"Error processing interface {interface.get('interface')}: {e}")
                 continue
 
         return interface_dict
 
+    def get_interfaces_counters(self) -> Dict[str, models.InterfaceCounterDict]:
+        output = self.send_command("display interface")
+        sections = self._separate_section(r"(^\S+.*current state.*$)", output)
+        counters: Dict[str, models.InterfaceCounterDict] = {}
+
+        for section in sections:
+            match_intf = re.search(r"^(?P<intf_name>\S+).+current state\W+(?P<intf_state>.+)$", section, flags=re.M)
+            if match_intf is None:
+                continue
+
+            intf_name = canonical_interface_name_comware(match_intf.group("intf_name"))
+            match_errors = re.findall(r"Total Error:\s+(\d+)|(\d+)\s+errors", section, flags=re.M)
+            match_unicast = re.findall(r"Unicast:\s+(\d+)|(\d+)\s+unicast", section, flags=re.M)
+            match_multicast = re.findall(r"Multicast:\s+(\d+)|(\d+)\s+multicast", section, flags=re.M)
+            match_broadcast = re.findall(r"Broadcast:\s+(\d+)|(\d+)\s+broadcast", section, flags=re.M)
+            match_discards = re.findall(r"Discard:\s+(\d+)|(\d+)\s+discard", section, flags=re.M)
+            match_rx_octets = re.findall(r"Input.+\s+(\d+)\sbytes|Input:.+,(\d+)\sbytes", section, flags=re.M)
+            match_tx_octets = re.findall(r"Output.+\s+(\d+)\sbytes|Output:.+,(\d+)\sbytes", section, flags=re.M)
+
+            counters[intf_name] = {
+                "tx_errors": self._process_count_match(match_errors, 1),
+                "rx_errors": self._process_count_match(match_errors, 0),
+                "tx_discards": self._process_count_match(match_discards, 1),
+                "rx_discards": self._process_count_match(match_discards, 0),
+                "tx_octets": self._process_count_match(match_tx_octets, 0),
+                "rx_octets": self._process_count_match(match_rx_octets, 0),
+                "tx_unicast_packets": self._process_count_match(match_unicast, 1),
+                "rx_unicast_packets": self._process_count_match(match_unicast, 0),
+                "tx_multicast_packets": self._process_count_match(match_multicast, 1),
+                "rx_multicast_packets": self._process_count_match(match_multicast, 0),
+                "tx_broadcast_packets": self._process_count_match(match_broadcast, 1),
+                "rx_broadcast_packets": self._process_count_match(match_broadcast, 0),
+            }
+
+        return counters
+
     def _parse_interface_status(self, interface: Dict[str, str]) -> tuple[bool, bool]:
         link_status = interface.get("link_status", "").lower()
         protocol_status = interface.get("protocol_status", "").lower()
-        is_enabled = "up" in link_status
+        is_enabled = "administratively" not in link_status
         protocol_status_split = protocol_status.split()
         if len(protocol_status_split) == 0:
-            logging.warning(f"cannot get up status for interface: {interface}")
+            logger.warning(f"cannot get up status for interface: {interface}")
             is_up = False
         else:
             is_up = "up" in protocol_status_split[0]
@@ -282,14 +796,15 @@ class ComwareDriver(NetworkDriver):
 
     def _parse_flapping(self, flapping_str: Optional[str]) -> Union[int, float]:
         if not flapping_str:
-            return -1
+            return -1.0
         flapping_str = flapping_str.lower()
         if "never" in flapping_str:
-            return 0
+            return -1.0
         try:
-            return self._parse_time(flapping_str)
+            elapsed = parse_time(flapping_str)
+            return time.time() - elapsed
         except Exception:
-            return -1
+            return -1.0
 
     def _parse_time(self, time_str: str) -> int:
         return parse_time(time_str)
@@ -331,7 +846,7 @@ class ComwareDriver(NetworkDriver):
 
                 lldp_neighbors.setdefault(str(local_if).strip(), []).append(neighbor)
 
-            except (KeyError, TypeError) as e:
+            except (KeyError, TypeError):
                 continue
             except Exception as e:
                 raise ValueError(f"LLDP data parsing error: {str(e)}") from e
@@ -339,27 +854,24 @@ class ComwareDriver(NetworkDriver):
         return lldp_neighbors
 
     def _get_memory(self, verbose: Literal[True, False] = True) -> MemoryResult:
-        """获取设备内存信息(支持多板卡场景)
+        """Get device memory info (multi-slot support).
 
         Args:
-            verbose: 是否返回详细的多板卡信息
+            verbose: Whether to return detailed per-slot info.
 
         Returns:
-            当 verbose=True 时返回包含所有板卡详细信息的字典
-            当 verbose=False 时返回内存压力最大的板卡摘要信息
+            When verbose=True, returns dict with all slot details.
+            When verbose=False, returns summary of most utilized slot.
 
         Raises:
-            CommandError: 设备命令执行失败时抛出
-            ValueError: 数据解析异常时抛出
+            CommandErrorException: If device command fails.
+            ValueError: If data parsing fails.
         """
         memory: Dict[str, MemoryEntry] = {}
         required_fields = ("chassis", "slot", "total", "used", "free", "free_ratio")
 
         try:
             structured_output = self._get_structured_output("display memory")
-            if not isinstance(structured_output, list):
-                raise ValueError("Invalid memory data format")
-
             get_mem_fields = itemgetter(*required_fields)
 
             for entry in structured_output:
@@ -396,19 +908,10 @@ class ComwareDriver(NetworkDriver):
         return CompactMemory(used_ram=most_used[1]["used_ram"], available_ram=most_used[1]["available_ram"])
 
     def _get_power(self) -> PowerDict:
-        """
-        获取设备电源信息
+        """Get device power supply info.
 
         Returns:
-            电源信息字典,格式为:
-            {
-                "slot 1 power 1": {
-                    "status": True,  # 或"Normal"
-                    "capacity": -1,
-                    "output": "12.5V"
-                },
-                ...
-            }
+            Dict keyed by slot/power ID, each containing status (bool), capacity (float), and output (str).
         """
         power: PowerDict = {}
         command = "display power"
@@ -432,17 +935,7 @@ class ComwareDriver(NetworkDriver):
         return power
 
     def _build_power_key(self, chassis: str, slot: str, power_id: str) -> str:
-        """
-        构建电源信息的键名
-
-        Args:
-            chassis: 机箱编号
-            slot: 插槽编号
-            power_id: 电源ID
-
-        Returns:
-            格式化后的键名字符串
-        """
+        """Build key name for power info dict."""
         if slot:
             return f"slot {slot} power {power_id}"
         if chassis:
@@ -450,28 +943,10 @@ class ComwareDriver(NetworkDriver):
         return f"power {power_id}"
 
     def _get_cpu(self, verbose: bool = True) -> models.CPUDict:
-        """
-        获取设备CPU使用率信息
+        """Get device CPU usage info.
 
         Args:
-            verbose: 返回详细数据(True返回三个时间维度的数据, False返回峰值使用率)
-
-        Returns:
-            CPU信息字典, 格式为:
-            verbose模式:
-            {
-                "Chassis 1 Slot 2 cpu 0": {
-                    "five_sec": 15.2,
-                    "one_min": 12.3,
-                    "five_min": 10.1
-                }
-            }
-            非verbose模式:
-            {
-                "Slot 3 cpu 1": {
-                    "%usage": 25.5  # 三个时间段中的最大值
-                }
-            }
+            verbose: True returns per-core five_sec/one_min/five_min, False returns peak %usage only.
         """
         cpu: models.CPUDict = {"%usage": 0}
         command = "display cpu-usage summary"
@@ -487,7 +962,7 @@ class ComwareDriver(NetworkDriver):
                 five_sec_f = float(five_sec)
                 one_min_f = float(one_min)
                 five_min_f = float(five_min)
-            except (ValueError, TypeError) as e:
+            except (ValueError, TypeError):
                 continue
 
             if verbose:
@@ -498,38 +973,14 @@ class ComwareDriver(NetworkDriver):
         return cpu
 
     def _build_cpu_key(self, chassis: str, slot: str, cpu_id: str) -> str:
-        """
-        构建CPU信息的键名
-
-        Args:
-            chassis: 机箱编号
-            slot: 插槽编号
-            cpu_id: CPU标识符
-
-        Returns:
-            格式化后的键名字符串
-        """
         if chassis:
-            return f"Chassis {chassis} Slot {slot} cpu {cpu_id}"
+            return f"chassis {chassis} slot {slot} cpu {cpu_id}"
         elif slot:
-            return f"Slot {slot} cpu {cpu_id}"
+            return f"slot {slot} cpu {cpu_id}"
         return f"cpu {cpu_id}"
 
     def _get_fan(self) -> FanDict:
-        """
-        获取设备风扇状态信息
-
-        Returns:
-            风扇信息字典,格式为:
-            {
-                "Slot 1 Fan 2": {
-                    "status": True  # True表示正常(Normal)
-                },
-                "Chassis 2 Fan 3": {
-                    "status": False  # False表示异常
-                }
-            }
-        """
+        """Get device fan status info. Returns dict keyed by slot/fan ID with status bool."""
         fans: FanDict = {}
         command = "display fan"
         structured_output = self._get_structured_output(command)
@@ -540,47 +991,19 @@ class ComwareDriver(NetworkDriver):
             fan_key = self._build_fan_key(chassis, slot, fan_id)
 
             status_bool = status.lower() == "normal"
-            fans[fan_key] = FanInfo(status=status_bool)
+            fans[fan_key] = models.FanDict(status=status_bool)
 
         return fans
 
     def _build_fan_key(self, chassis: str, slot: str, fan_id: str) -> str:
-        """
-        构建风扇信息的键名
-
-        Args:
-            chassis: 机箱编号
-            slot: 插槽编号
-            fan_id: 风扇标识符
-
-        Returns:
-            格式化后的键名字符串
-        """
         if slot:
-            return f"Slot {slot} Fan {fan_id}"
+            return f"slot {slot} fan {fan_id}"
         elif chassis:
-            return f"Chassis {chassis} Fan {fan_id}"
-        return f"Fan {fan_id}"
+            return f"chassis {chassis} fan {fan_id}"
+        return f"fan {fan_id}"
 
     def _get_temperature(self) -> TemperatureDict:
-        """
-        获取设备温度传感器信息
-
-        Returns:
-            温度信息字典,格式为:
-            {
-                "chassis 1 slot 2 sensor 3": {
-                    "temperature": 45.2,
-                    "is_alert": True,
-                    "is_critical": False
-                },
-                "slot 4 sensor 1": {
-                    "temperature": 38.5,
-                    "is_alert": False,
-                    "is_critical": False
-                }
-            }
-        """
+        """Get device temperature sensor info. Returns dict with temperature, is_alert, is_critical per sensor."""
         temperature: TemperatureDict = {}
         command = "display environment"
         structured_output = self._get_structured_output(command)
@@ -599,100 +1022,97 @@ class ComwareDriver(NetworkDriver):
 
             temp_key = self._build_temp_key(chassis, slot, sensor)
 
-            temperature[temp_key] = TemperatureInfo(
+            temperature[temp_key] = models.TemperatureDict(
                 temperature=temp_f, is_alert=temp_f >= alert_f, is_critical=temp_f >= critical_f
             )
 
         return temperature
 
     def _build_temp_key(self, chassis: str, slot: str, sensor: str) -> str:
-        """
-        构建温度信息的键名
-
-        Args:
-            chassis: 机箱编号
-            slot: 插槽编号
-            sensor: 传感器标识符
-
-        Returns:
-            格式化后的键名字符串
-        """
+        """Build key name for temperature sensor dict."""
         if chassis:
             return f"chassis {chassis} slot {slot} sensor {sensor}"
         return f"slot {slot} sensor {sensor}"
 
-    def get_environment(self, use_cache: bool = True) -> EnvironmentDict:  # type: ignore
-        """
-        获取设备环境数据(并行采集各子系统数据)
+    def get_environment(self, use_cache: bool = True) -> EnvironmentDict:
+        """Get device environment data (CPU, memory, power, fans, temperature) in parallel.
 
         Args:
-            use_cache: 是否使用缓存数据(默认True), 设置为False强制刷新
+            use_cache: Whether to use cached data (default True). Set False to force refresh.
 
         Returns:
-            环境数据字典,结构为:
-            {
-                "cpu": Dict[str, Any],         # CPU使用率数据
-                "memory": Dict[str, Any],      # 内存使用数据
-                "power": Dict[str, Any],       # 电源状态数据
-                "fans": Dict[str, Any],        # 风扇状态数据
-                "temperature": Dict[str, Any]  # 温度传感器数据
-            }
+            EnvironmentDict with cpu, memory, power, fans, temperature keys.
 
         Raises:
-            EnvironmentError: 当任何子系统数据获取失败时
+            RuntimeError: If any subsystem data collection fails.
         """
         if use_cache and self._is_cache_valid():
-            assert self._env_cache
+            if self._env_cache is None:
+                raise RuntimeError("Environment cache is empty but was expected to be populated")
             return self._env_cache
 
         try:
             with ThreadPoolExecutor(max_workers=5) as executor:
                 get_data = partial(self._get_subsystem_data, verbose=False)
+                futures = {
+                    "cpu": executor.submit(get_data, "_get_cpu"),
+                    "memory": executor.submit(get_data, "_get_memory"),
+                    "power": executor.submit(self._get_power),
+                    "fans": executor.submit(self._get_fan),
+                    "temperature": executor.submit(self._get_temperature),
+                }
 
-                future_cpu = executor.submit(get_data, "_get_cpu")
-                future_mem = executor.submit(get_data, "_get_memory")
-                future_power = executor.submit(self._get_power)
-                future_fans = executor.submit(self._get_fan)
-                future_temp = executor.submit(self._get_temperature)
+                raw_cpu = futures["cpu"].result()
+                raw_memory = cast(models.MemoryDict, futures["memory"].result())
+                cpu_usage: Dict[int, models.CPUDict] = {}
+
+                for cpu_key, cpu_data in raw_cpu.items():
+                    if cpu_key == "%usage" or not isinstance(cpu_data, dict):
+                        continue
+                    cpu_data_dict = cast(Dict[str, Any], cpu_data)
+                    usage = cpu_data_dict.get("%usage")
+                    if isinstance(usage, (int, float)):
+                        cpu_usage[len(cpu_usage)] = {"%usage": float(usage)}
 
                 environment = EnvironmentDict(
-                    cpu=future_cpu.result(),
-                    memory=future_mem.result(),
-                    power=future_power.result(),
-                    fans=future_fans.result(),
-                    temperature=future_temp.result(),
+                    cpu=cpu_usage,
+                    memory=raw_memory,
+                    power=futures["power"].result(),
+                    fans=futures["fans"].result(),
+                    temperature=futures["temperature"].result(),
                 )
-
-            self._env_cache = environment
-            self._last_update_time = time.time()
-
         except Exception as e:
-            logging.error(f"Environment data collection failed: {str(e)}")
-            raise EnvironmentError("Failed to collect environment data") from e
+            logger.error(f"Environment data collection failed: {str(e)}")
+            raise RuntimeError("Failed to collect environment data") from e
+
+        self._env_cache = environment
+        self._last_update_time = time.time()
 
         return environment
 
-    def _get_subsystem_data(self, method_name: str, **kwargs) -> Dict[str, Any]:
+    def _get_subsystem_data(self, method_name: str, **kwargs: Any) -> Dict[str, Any]:
         try:
             method = getattr(self, method_name)
-            return method(**kwargs)
+            return cast(Dict[str, Any], method(**kwargs))
         except Exception as e:
-            logging.error(f"Failed to get {method_name} data: {str(e)}")
-            return {}
+            logger.error(f"Failed to get {method_name} data: {str(e)}")
+            raise RuntimeError(f"Failed to get {method_name} data") from e
 
     def _is_cache_valid(self) -> bool:
         return self._env_cache is not None and (time.time() - self._last_update_time) < self._cache_ttl
 
-    def clear_cache(self):
+    def clear_cache(self) -> None:
         self._env_cache = None
-        self._last_update_time = 0
+        self._last_update_time = 0.0
 
-    def get_lldp_neighbors_detail(self, interface: str = ""):
-        lldp = {}
+    def get_lldp_neighbors_detail(self, interface: str = "") -> models.LLDPNeighborsDetailDict:
+        lldp: models.LLDPNeighborsDetailDict = {}
         parent_interface = ""
 
         if interface:
-            command = "display lldp neighbor-information interface %s verbose" % (interface)
+            if not re.match(r"^[a-zA-Z0-9/_-]+$", interface):
+                raise ValueError(f"Invalid interface name: {interface}")
+            command = f"display lldp neighbor-information interface {interface} verbose"
         else:
             command = "display lldp neighbor-information verbose"
 
@@ -720,57 +1140,58 @@ class ComwareDriver(NetworkDriver):
             )(
                 lldp_entry
             )
-            _ = {
+            neighbor_detail: models.LLDPNeighborDetailDict = {
                 "parent_interface": parent_interface,
-                "remote_port": remote_port,
-                "remote_port_description": remote_port_description,
-                "remote_chassis_id": remote_chassis_id,
-                "remote_system_name": remote_system_name,
-                "remote_system_description": "".join(remote_system_description),
-                "remote_system_capab": [i.strip() for i in remote_system_capab.split(",")],
-                "remote_system_enabled_capab": [i.strip() for i in remote_system_enabled_capab.split(",")],
+                "remote_port": str(remote_port),
+                "remote_port_description": str(remote_port_description),
+                "remote_chassis_id": str(remote_chassis_id),
+                "remote_system_name": str(remote_system_name),
+                "remote_system_description": " ".join(_as_str_list(remote_system_description)).strip(),
+                "remote_system_capab": [x.strip() for x in remote_system_capab.split(",") if x.strip()],
+                "remote_system_enable_capab": [x.strip() for x in remote_system_enabled_capab.split(",") if x.strip()],
             }
-            if lldp.get(local_interface) is None:
-                lldp[local_interface] = [_]
+            local_interface_name = str(local_interface)
+            if local_interface_name not in lldp:
+                lldp[local_interface_name] = [neighbor_detail]
             else:
-                lldp[local_interface].append(_)
+                lldp[local_interface_name].append(neighbor_detail)
         return lldp
 
-    def cli(self, commands: List, encoding: str = "text") -> Dict[str, Union[str, Dict[str, Any]]]:
-        cli_output = dict()
+    def cli(self, commands: List[str], encoding: str = "text") -> Dict[str, Union[str, Dict[str, Any]]]:
+        cli_output: Dict[str, Union[str, Dict[str, Any]]] = {}
 
-        if type(commands) is not list:
-            raise TypeError("Please enter a valid list of commands!")
+        if encoding != "text":
+            raise NotImplementedError(f"Unsupported encoding: {encoding}")
+        if not isinstance(commands, list):
+            raise TypeError("commands must be provided as a list of strings")
+        if not all(isinstance(command, str) for command in commands):
+            raise TypeError("commands must contain only strings")
 
         for command in commands:
-            output = self.device.send_command(command)
-            cli_output.setdefault(command, {})
-            cli_output[command] = output
+            cli_output[command] = self.send_command(command)
 
         return cli_output
 
     def get_arp_table(self, vrf: str = "") -> List[ArpEntry]:
-        """获取ARP表信息(支持VRF)
+        """Get ARP table (supports VRF).
 
         Args:
-            vrf: 可选参数, 指定VRF实例名称。默认为全局路由表
+            vrf: Optional VRF instance name. Defaults to global routing table.
 
         Returns:
-            标准化ARP条目列表, 每个条目包含:
-            - interface: 规范化后的接口名
-            - mac: 标准化的MAC地址
-            - ip: IP地址
-            - age: 老化时间(秒)
+            List of ArpEntry with interface, mac, ip, age fields.
 
         Raises:
-            CommandErrorException: CLI命令执行失败时
-            ValueError: 数据解析失败时
+            CommandErrorException: If CLI command fails.
+            ValueError: If VRF name is invalid.
         """
+        if vrf and not re.match(r"^[a-zA-Z0-9_.-]+$", vrf):
+            raise ValueError(f"Invalid VRF name: {vrf}")
         command = f"display arp vpn-instance {vrf}" if vrf else "display arp"
         try:
             structured_output: List[Dict[str, str]] = self._get_structured_output(command, template_name="display_arp")
         except Exception as e:
-            raise CommandErrorException(f"ARP command excute error: {command}") from e
+            raise CommandErrorException(f"ARP command execute error: {command}") from e
 
         arp_table: List[ArpEntry] = []
         required_fields = ("interface", "mac_address", "ip_address", "aging")
@@ -787,9 +1208,45 @@ class ComwareDriver(NetworkDriver):
                 }
                 arp_table.append(entry)
             except (KeyError, ValueError) as e:
-                raise ValueError(f"无效ARP条目: {arp_entry}") from e
+                logger.warning(f"Skipping invalid ARP entry: {arp_entry}, error: {e}")
+                continue
 
         return arp_table
+
+    def get_ipv6_neighbors_table(self) -> List[models.IPV6NeighborDict]:
+        output = self.send_command("display ipv6 neighbors")
+        neighbors: List[models.IPV6NeighborDict] = []
+        patterns = (
+            re.compile(r"^(?P<ip>[0-9a-fA-F:]+)\s+(?P<mac>[0-9A-Fa-f-]+)\s+(?P<state>\S+)\s+(?P<interface>\S+)$"),
+            re.compile(
+                r"^(?P<ip>[0-9a-fA-F:]+)\s+(?P<mac>[0-9A-Fa-f-]+)\s+(?P<age>\d+)\s+(?P<state>\S+)\s+(?P<interface>\S+)$"
+            ),
+        )
+
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.lower().startswith(("ipv6 address", "<")):
+                continue
+
+            match = None
+            for pattern in patterns:
+                match = pattern.match(stripped)
+                if match:
+                    break
+            if match is None:
+                continue
+
+            neighbors.append(
+                {
+                    "interface": canonical_interface_name_comware(match.group("interface")),
+                    "mac": mac(match.group("mac")),
+                    "ip": match.group("ip"),
+                    "age": float(match.groupdict().get("age", -1) or -1),
+                    "state": match.group("state"),
+                }
+            )
+
+        return neighbors
 
     def get_interfaces_ip(self) -> Dict[str, models.InterfacesIPDict]:
         interfaces: Dict[str, models.InterfacesIPDict] = {}
@@ -802,9 +1259,9 @@ class ComwareDriver(NetworkDriver):
 
         for iface_entry in structured_output:
             try:
-                interface: str
-                ip_list: List[str]
-                interface, ip_list = itemgetter("interface", "ip_address")(iface_entry)
+                interface = str(iface_entry["interface"])
+                ip_list_raw = iface_entry["ip_address"]
+                ip_list = _as_str_list(ip_list_raw)
 
                 if not ip_list:
                     continue
@@ -814,13 +1271,13 @@ class ComwareDriver(NetworkDriver):
                     try:
                         ip, prefix = ip_entry.split("/")
                         ipv4[ip] = {"prefix_length": int(prefix)}
-                    except (ValueError, IndexError) as e:
+                    except (ValueError, IndexError):
                         continue
 
                 if ipv4:
                     interfaces[interface] = {"ipv4": ipv4}
 
-            except KeyError as e:
+            except KeyError:
                 continue
 
         return interfaces
@@ -862,7 +1319,7 @@ class ComwareDriver(NetworkDriver):
                 ) = field_getter(mac_move_entry)
 
                 entry: MacMoveEntry = {
-                    "mac": str(EUI(mac_address)),
+                    "mac": mac(str(mac_address)),
                     "vlan": int(vlan),
                     "current_port": canonical_interface_name_comware(current_port),
                     "source_port": canonical_interface_name_comware(source_port),
@@ -872,37 +1329,32 @@ class ComwareDriver(NetworkDriver):
                 mac_address_move_table.append(entry)
 
             except (KeyError, ValueError, AttributeError) as e:
-                logging.warning(f"error when execute command: {command},error: {e}")
+                logger.warning(f"error when execute command: {command},error: {e}")
                 continue
 
         return mac_address_move_table
 
-    def get_mac_address_table(self):
-        mac_address_table = []
+    def get_mac_address_table(self) -> List[models.MACAdressTable]:
         command = "display mac-address"
         structured_output = self._get_structured_output(command)
         mac_address_move_table = self.get_mac_address_move_table()
 
-        def _get_mac_move(mac_address, mac_address_move_table):
-            last_move = float(-1)
-            moves = -1
-            for mac_move in mac_address_move_table:
-                if mac_address == mac_move.get("mac_address"):
-                    last_move = strptime(mac_move.get("last_move"))
-                    moves = mac_move.get("times")
-            return {"last_move": float(last_move), "moves": int(moves)}
+        move_by_mac = {(entry["mac"], entry["vlan"]): entry for entry in mac_address_move_table}
 
+        mac_address_table: List[models.MACAdressTable] = []
         for mac_entry in structured_output:
             (mac_address, vlan, state, interface) = itemgetter("mac_address", "vlan", "state", "interface")(mac_entry)
-            entry = {
-                "mac": mac(mac_address),
+            normalized_mac = mac(mac_address)
+            move_info = move_by_mac.get((normalized_mac, int(vlan)))
+            entry: models.MACAdressTable = {
+                "mac": normalized_mac,
                 "interface": canonical_interface_name_comware(interface),
                 "vlan": int(vlan),
-                "static": True if "tatic" in state.lower() else False,
-                "state": state,
+                "static": "tatic" in state.lower(),
                 "active": True,
+                "last_move": strptime(move_info["last_move"]) if move_info else -1.0,
+                "moves": int(move_info["moves"]) if move_info else -1,
             }
-            entry.update(_get_mac_move(mac_address, mac_address_move_table))
             mac_address_table.append(entry)
 
         return mac_address_table
@@ -914,29 +1366,19 @@ class ComwareDriver(NetworkDriver):
         sanitized: bool = False,
         format: str = "text",
     ) -> models.ConfigDict:
-        """
-        获取设备配置信息
+        """Get device configuration.
 
         Args:
-            retrieve: 要检索的配置类型,可选值为:
-                - "all": 获取所有配置(默认)
-                - "running": 只获取运行配置
-                - "startup": 只获取启动配置
-                - "candidate": 候选配置(暂不支持)
-            full: 是否获取完整配置(暂不支持)
-            sanitized: 是否对敏感信息进行脱敏处理(暂不支持)
-            format: 返回格式,支持 "text" 或 "json"(暂不支持)
+            retrieve: Config type - "all", "running", "startup", or "candidate" (not yet supported).
+            full: Full config retrieval (not yet implemented).
+            sanitized: Sanitize sensitive info (not yet implemented).
+            format: "text" or "json" (json not yet implemented).
 
         Returns:
-            包含配置信息的字典,格式为:
-            {
-                "startup": str,
-                "running": str,
-                "candidate": str
-            }
+            Dict with startup, running, candidate keys.
 
         Raises:
-            ValueError: 当传入无效的retrieve参数时
+            ValueError: If invalid retrieve value or format.
         """
         if retrieve.lower() not in ("all", "running", "startup", "candidate"):
             raise ValueError(f"Invalid retrieve value: {retrieve}. Must be one of: all, running, startup, candidate")
@@ -949,82 +1391,506 @@ class ComwareDriver(NetworkDriver):
         try:
             if retrieve.lower() in ("running", "all"):
                 command = "display current-configuration"
-                configs["running"] = self.send_command(command)  # type: ignore
+                configs["running"] = self.send_command(command)
 
             if retrieve.lower() in ("startup", "all"):
                 command = "display saved-configuration"
-                configs["startup"] = self.send_command(command)  # type: ignore
+                configs["startup"] = self.send_command(command)
 
-            # TODO: 实现完整配置获取功能
+            if retrieve.lower() in ("candidate", "all"):
+                configs["candidate"] = self._candidate_config
+
+            # TODO: implement full config retrieval
             if full:
-                logging.warning("Full config retrieval is not yet implemented")
+                logger.warning("Full config retrieval is not yet implemented")
 
-            # TODO: 实现配置脱敏功能
+            # TODO: implement config sanitization
             if sanitized:
-                logging.warning("Config sanitization is not yet implemented")
+                logger.warning("Config sanitization is not yet implemented")
 
-            # TODO: 实现格式转换功能
+            # TODO: implement output format conversion
             if format.lower() == "json":
-                logging.warning("JSON format is not yet implemented")
+                logger.warning("JSON format is not yet implemented")
 
         except Exception as e:
-            logging.error(f"Failed to retrieve config: {str(e)}")
+            logger.error(f"Failed to retrieve config: {str(e)}")
             raise
 
         return configs
 
+    def load_merge_candidate(self, filename: Optional[str] = None, config: Optional[str] = None) -> None:
+        self._candidate_config = self._load_candidate_config(
+            filename=filename,
+            config=config,
+            exception_cls=MergeConfigException,
+        )
+        self._replace_candidate = False
+
+    def load_replace_candidate(self, filename: Optional[str] = None, config: Optional[str] = None) -> None:
+        self._candidate_config = self._load_candidate_config(
+            filename=filename,
+            config=config,
+            exception_cls=ReplaceConfigException,
+        )
+        self._replace_candidate = True
+
+    def compare_config(self) -> str:
+        if not self._candidate_config.strip():
+            return ""
+
+        running_config = self.get_config(retrieve="running")["running"]
+        running_lines = set(running_config.splitlines())
+
+        if self._replace_candidate:
+            diff = difflib.unified_diff(
+                running_config.splitlines(),
+                self._candidate_config.splitlines(),
+                fromfile="running-config",
+                tofile="candidate-config",
+                lineterm="",
+            )
+            return "\n".join(diff)
+
+        added_lines = [
+            line
+            for line in self._candidate_config.splitlines()
+            if line.strip() and line.strip() not in ("#", "return") and line not in running_lines
+        ]
+        if not added_lines:
+            return "No changes to commit."
+        return "The following lines will be added:\n" + "\n".join(added_lines)
+
+    def discard_config(self) -> None:
+        self._candidate_config = ""
+        self._replace_candidate = False
+
+    def commit_config(self, message: str = "", revert_in: Optional[int] = None) -> None:
+        if message:
+            raise NotImplementedError("Comware does not support commit messages")
+        if revert_in is not None:
+            raise NotImplementedError("Comware does not support commit confirm/revert timers")
+        if not self._candidate_config.strip():
+            return
+        if self._replace_candidate:
+            raise ReplaceConfigException("Comware replace commit is not yet supported")
+
+        commands = [
+            line.strip()
+            for line in self._candidate_config.splitlines()
+            if line.strip() and line.strip() not in ("#", "return")
+        ]
+        if not commands:
+            self.discard_config()
+            return
+
+        backup_file = self._BACKUP_CONFIG_FILES[1] if self._replace_candidate else self._BACKUP_CONFIG_FILES[0]
+        try:
+            backup_output = self.send_command(f"save force {backup_file} safely")
+            if _has_cli_error(backup_output):
+                logger.warning(f"Failed to save pre-commit backup to {backup_file}: {backup_output.strip()}")
+            else:
+                self._last_backup_file = backup_file
+        except Exception:
+            logger.warning(f"Failed to save pre-commit backup to {backup_file}, proceeding anyway")
+
+        try:
+            self.send_config_set(commands)
+            self.send_command("save force")
+        except Exception as exc:
+            raise CommitError("Failed to commit candidate config on Comware") from exc
+
+        self.discard_config()
+
+    def rollback(self) -> None:
+        cast(HPComwareBase, self.device)
+        backup_files = self._get_backup_files_for_rollback()
+
+        for backup_file in backup_files:
+            for command in (
+                f"rollback configuration to file {backup_file}",
+                f"configuration replace file flash:/{backup_file}",
+            ):
+                try:
+                    rollback_output = self.send_command(command)
+                except Exception:
+                    continue
+                if _has_cli_error(rollback_output):
+                    continue
+
+                save_output = self.send_command("save force")
+                if _has_cli_error(save_output):
+                    raise ReplaceConfigException("Rollback restored config but failed to save it")
+
+                self._last_backup_file = backup_file
+                self.discard_config()
+                return
+        raise ReplaceConfigException("Rollback failed: no backup config found on flash")
+
+    def _get_backup_files_for_rollback(self) -> List[str]:
+        directory_output = ""
+        for command in ("dir flash:", "display directory flash:"):
+            try:
+                response = self.send_command(command)
+            except Exception:
+                continue
+            if _has_cli_error(response):
+                continue
+            directory_output = response
+            break
+
+        if directory_output:
+            timestamps = _parse_directory_timestamps(directory_output, list(self._BACKUP_CONFIG_FILES))
+            if timestamps:
+                ranked_files = sorted(
+                    self._BACKUP_CONFIG_FILES,
+                    key=lambda file: (
+                        timestamps.get(file, -1),
+                        1 if file == self._last_backup_file else 0,
+                    ),
+                    reverse=True,
+                )
+                return list(ranked_files)
+
+        backup_files: List[str] = []
+        if self._last_backup_file:
+            backup_files.append(self._last_backup_file)
+        backup_files.extend(file for file in self._BACKUP_CONFIG_FILES if file not in backup_files)
+        return backup_files
+
+    def get_ntp_peers(self) -> Dict[str, models.NTPPeerDict]:
+        ntp_peers: Dict[str, models.NTPPeerDict] = {}
+        for line in self._get_running_config_lines():
+            match = re.match(r"^ntp-service peer (?P<peer>\S+)", line)
+            if match:
+                ntp_peers[match.group("peer")] = {}
+        return ntp_peers
+
+    def get_ntp_servers(self) -> Dict[str, models.NTPServerDict]:
+        ntp_servers: Dict[str, models.NTPServerDict] = {}
+        server_patterns = (
+            r"^ntp-service server (?P<server>\S+)",
+            r"^ntp-service unicast-server (?P<server>\S+)",
+            r"^ntp-service multicast-server (?P<server>\S+)",
+            r"^ntp-service broadcast-server (?P<server>\S+)",
+        )
+        for line in self._get_running_config_lines():
+            for pattern in server_patterns:
+                match = re.match(pattern, line)
+                if match:
+                    ntp_servers[match.group("server")] = {}
+                    break
+        return ntp_servers
+
+    def get_ntp_stats(self) -> List[models.NTPStats]:
+        output = self.send_command("display ntp sessions")
+        ntp_stats: List[models.NTPStats] = []
+
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("address", "=", "<")):
+                continue
+
+            match = re.match(
+                r"^(?P<flag>[\*\+\-x#~o ]?)\s*(?P<remote>\S+)\s+(?P<refid>\S+)\s+"
+                r"(?P<stratum>\d+)\s+(?P<assoc_type>\S+)\s+(?P<when>\S+)\s+"
+                r"(?P<poll>\d+)\s+(?P<reach>\d+)\s+(?P<delay>[\d.]+)\s+"
+                r"(?P<offset>[-\d.]+)\s+(?P<disp>[\d.]+)$",
+                stripped,
+            )
+            if match is None:
+                continue
+
+            ntp_stats.append(
+                {
+                    "remote": match.group("remote"),
+                    "referenceid": match.group("refid"),
+                    "synchronized": match.group("flag") == "*",
+                    "stratum": int(match.group("stratum")),
+                    "type": match.group("assoc_type"),
+                    "when": match.group("when"),
+                    "hostpoll": int(match.group("poll")),
+                    "reachability": int(match.group("reach")),
+                    "delay": float(match.group("delay")),
+                    "offset": float(match.group("offset")),
+                    "jitter": float(match.group("disp")),
+                }
+            )
+
+        if ntp_stats:
+            return ntp_stats
+
+        output = self.send_command("display ntp status")
+        sync_match = re.search(r"Clock?\s+status:\s+(?P<status>\S+)", output, re.I)
+        stratum_match = re.search(r"Clock?\s+stratum:\s+(?P<stratum>\d+)", output, re.I)
+        refid_match = re.search(r"Reference clock ID:\s+(?P<refid>\S+)", output, re.I)
+        if sync_match and stratum_match and refid_match:
+            return [
+                {
+                    "remote": refid_match.group("refid"),
+                    "referenceid": refid_match.group("refid"),
+                    "synchronized": sync_match.group("status").lower() == "synchronized",
+                    "stratum": int(stratum_match.group("stratum")),
+                    "type": "-",
+                    "when": "",
+                    "hostpoll": 0,
+                    "reachability": 0,
+                    "delay": 0.0,
+                    "offset": 0.0,
+                    "jitter": 0.0,
+                }
+            ]
+
+        return []
+
+    def get_snmp_information(self) -> models.SNMPDict:
+        communities: Dict[str, models.SNMPCommunityDict] = {}
+        contact = ""
+        location = ""
+
+        for line in self._get_running_config_lines():
+            community_match = re.match(
+                r"^snmp-agent community (?P<mode>read|write) (?:(?:cipher|simple)\s+)?(?P<name>\S+)(?: acl (?P<acl>\S+))?",
+                line,
+            )
+            if community_match:
+                mode = "ro" if community_match.group("mode") == "read" else "rw"
+                communities[community_match.group("name")] = {
+                    "mode": mode,
+                    "acl": community_match.group("acl") or "",
+                }
+                continue
+
+            contact_match = re.match(r"^snmp-agent sys-info contact (?P<contact>.+)$", line)
+            if contact_match:
+                contact = contact_match.group("contact").strip()
+                continue
+
+            location_match = re.match(r"^snmp-agent sys-info location (?P<location>.+)$", line)
+            if location_match:
+                location = location_match.group("location").strip()
+
+        facts = self.get_facts()
+        chassis_id = facts["serial_number"] if "serial_number" in facts else ""
+        return {
+            "chassis_id": chassis_id,
+            "community": communities,
+            "contact": contact,
+            "location": location,
+        }
+
+    def get_network_instances(self, name: str = "") -> Dict[str, models.NetworkInstanceDict]:
+        network_instances: Dict[str, models.NetworkInstanceDict] = {
+            "default": {
+                "name": "default",
+                "type": "DEFAULT_INSTANCE",
+                "state": {"route_distinguisher": ""},
+                "interfaces": {"interface": {}},
+            }
+        }
+        interface_bindings: Dict[str, str] = {}
+        current_instance: Optional[str] = None
+        current_interface: Optional[str] = None
+
+        for raw_line in self.get_config(retrieve="running")["running"].splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            if not raw_line.startswith(" "):
+                current_instance = None
+                current_interface = None
+
+                if stripped.startswith("ip vpn-instance "):
+                    current_instance = stripped.split(maxsplit=2)[2]
+                    network_instances.setdefault(
+                        current_instance,
+                        {
+                            "name": current_instance,
+                            "type": "L3VRF",
+                            "state": {"route_distinguisher": ""},
+                            "interfaces": {"interface": {}},
+                        },
+                    )
+                    continue
+
+                if stripped.startswith("interface "):
+                    current_interface = canonical_interface_name_comware(stripped.split(maxsplit=1)[1])
+                    interface_bindings.setdefault(current_interface, "default")
+                    continue
+
+            if current_instance and stripped.startswith("route-distinguisher "):
+                network_instances[current_instance]["state"]["route_distinguisher"] = stripped.split(maxsplit=1)[1]
+                continue
+
+            if current_interface:
+                vrf_match = re.match(r"^(?:ip binding )?vpn-instance (?P<vrf>\S+)$", stripped)
+                if vrf_match:
+                    vrf_name = vrf_match.group("vrf")
+                    interface_bindings[current_interface] = vrf_name
+                    network_instances.setdefault(
+                        vrf_name,
+                        {
+                            "name": vrf_name,
+                            "type": "L3VRF",
+                            "state": {"route_distinguisher": ""},
+                            "interfaces": {"interface": {}},
+                        },
+                    )
+
+        for interface_name, vrf_name in interface_bindings.items():
+            network_instances.setdefault(
+                vrf_name,
+                {
+                    "name": vrf_name,
+                    "type": "L3VRF",
+                    "state": {"route_distinguisher": ""},
+                    "interfaces": {"interface": {}},
+                },
+            )
+            network_instances[vrf_name]["interfaces"]["interface"][interface_name] = {}
+
+        if name:
+            return {name: network_instances[name]} if name in network_instances else {}
+        return network_instances
+
+    def _load_candidate_config(
+        self,
+        filename: Optional[str] = None,
+        config: Optional[str] = None,
+        exception_cls: Type[Exception] = MergeConfigException,
+    ) -> str:
+        if filename:
+            try:
+                return Path(filename).read_text()
+            except OSError as exc:
+                raise exception_cls(f"Unable to read candidate config file: {filename}") from exc
+
+        if config is None:
+            raise exception_cls("filename or config must be provided")
+
+        return config
+
+    def _get_running_config_lines(self) -> List[str]:
+        return [line.strip() for line in self.get_config(retrieve="running")["running"].splitlines() if line.strip()]
+
+    @staticmethod
+    def _separate_section(separator: str, content: str) -> List[str]:
+        if content == "":
+            return []
+
+        sections = re.split(separator, content, flags=re.M)
+        if len(sections) == 1:
+            return [content]
+
+        sections.pop(0)
+        if len(sections) % 2 != 0:
+            raise ValueError(f"Unexpected output data:\n{content}")
+
+        section_iter = iter(sections)
+        return [header + next(section_iter, "") for header in section_iter]
+
+    @staticmethod
+    def _process_count_match(matches: List[tuple[str, str]], index: int) -> int:
+        if len(matches) <= index:
+            return 0
+        for item in matches[index]:
+            if item:
+                return int(item)
+        return 0
+
+    @staticmethod
+    def _map_user_level(value: str) -> int:
+        normalized = value.strip().lower()
+        if normalized in {"manage", "system", "network-admin"}:
+            return 15
+        if normalized in {"monitor", "network-operator"}:
+            return 5
+        if normalized in {"visit", "network-monitor"}:
+            return 1
+        return 0
+
+    def get_users(self) -> Dict[str, models.UsersDict]:
+        users: Dict[str, models.UsersDict] = {}
+        config = self.get_config(retrieve="running")["running"]
+        blocks = re.split(r"(?m)^\s*#\s*$", config)
+
+        for block in blocks:
+            lines = [line.rstrip() for line in block.splitlines() if line.strip()]
+            if not lines:
+                continue
+
+            header = lines[0].strip()
+            header_match = re.match(r"^local-user\s+(?P<username>\S+)(?:\s+class\s+(?P<user_class>\S+))?$", header)
+            if header_match is None:
+                continue
+
+            username = header_match.group("username")
+            user: models.UsersDict = {
+                "level": self._map_user_level(header_match.group("user_class") or ""),
+                "password": "",
+                "sshkeys": [],
+            }
+
+            for raw_line in lines[1:]:
+                line = raw_line.strip()
+
+                password_match = re.match(
+                    r"^password\s+(?:cipher|simple|irreversible-cipher)\s+(?P<password>.+)$",
+                    line,
+                )
+                if password_match:
+                    user["password"] = password_match.group("password").strip()
+                    continue
+
+                role_match = re.match(r"^authorization-attribute\s+user-role\s+(?P<role>\S+)$", line)
+                if role_match:
+                    user["level"] = max(user["level"], self._map_user_level(role_match.group("role")))
+
+            users[username] = user
+
+        return users
+
     def get_vlans(self) -> Dict[str, models.VlanDict]:
-        """获取设备VLAN信息
+        """Get device VLAN info.
 
         Returns:
-            结构化VLAN信息字典,格式:
-            {
-                vlan_id(int): {
-                    "name": str,          # VLAN名称(优先使用非默认描述)
-                    "interfaces": List[str]  # 关联接口列表
-                }
-            }
+            Dict keyed by VLAN ID, each with name (str) and interfaces (List[str]).
 
         Raises:
-            CommandError: 命令执行失败时
-            ValueError: 数据解析失败时
-
-        Example:
-            {
-                1: {
-                    "name": "default",
-                    "interfaces": ["GigabitEthernet0/0/1"]
-                },
-                100: {
-                    "name": "mgmt_vlan",
-                    "interfaces": []
-                }
-            }
+            CommandErrorException: If VLAN command fails.
+            ValueError: If data parsing fails.
         """
-        DEFAULT_VLAN_PREFIX = "VLAN "
         command = "display vlan all"
         try:
             structured_output: List[Dict[str, Union[str, List[str]]]] = self._get_structured_output(command)
         except Exception as e:
             raise CommandErrorException(f"VLAN command execute failed: {command}") from e
 
-        vlans = {}
+        vlans: Dict[str, models.VlanDict] = {}
         required_fields = ("vlan_id", "name", "description", "interfaces")
         get_fields = itemgetter(*required_fields)
 
         for vlan_entry in structured_output:
             try:
                 vlan_id, name, desc, interfaces = get_fields(vlan_entry)
+                vlan_id_str = str(vlan_id)
+                name_str = str(name)
+                desc_str = str(desc)
+                interface_list = _as_str_list(interfaces) if isinstance(interfaces, list) else []
                 final_name = (
-                    desc if not desc.startswith(DEFAULT_VLAN_PREFIX) and name.startswith(DEFAULT_VLAN_PREFIX) else name
+                    desc_str
+                    if not desc_str.startswith(self._DEFAULT_VLAN_PREFIX)
+                    and name_str.startswith(self._DEFAULT_VLAN_PREFIX)
+                    else name_str
                 )
 
-                vlans[vlan_id] = {
+                vlans[vlan_id_str] = {
                     "name": final_name.strip(),
-                    "interfaces": [canonical_interface_name_comware(iface) for iface in interfaces if iface],
+                    "interfaces": [canonical_interface_name_comware(str(iface)) for iface in interface_list if iface],
                 }
             except (KeyError, ValueError, AttributeError) as e:
-                raise ValueError(f"invalid vala item: {vlan_entry}") from e
+                raise ValueError(f"invalid vlan item: {vlan_entry}") from e
 
         return vlans
 
@@ -1033,7 +1899,7 @@ class ComwareDriver(NetworkDriver):
         try:
             structured_output = self._get_structured_output(command)
         except Exception as e:
-            raise CommandErrorException(f"IRF配置命令执行失败: {command}") from e
+            raise CommandErrorException(f"IRF config command failed: {command}") from e
 
         temp_config: Dict[int, Dict[str, List[str]]] = defaultdict(lambda: {"irf-port1": [], "irf-port2": []})
 
@@ -1041,7 +1907,7 @@ class ComwareDriver(NetworkDriver):
             try:
                 member_id = int(config["member_id"])
                 port_id = str(config["port_id"])
-                port_member = config["port_member"] or []
+                port_member = _as_str_list(config.get("port_member"))
                 port_key = f"irf-port{port_id}"
 
                 if port_key not in ("irf-port1", "irf-port2"):
@@ -1049,7 +1915,7 @@ class ComwareDriver(NetworkDriver):
 
                 temp_config[member_id][port_key] = [self._normalize_interface(iface) for iface in port_member if iface]
             except (KeyError, ValueError) as e:
-                raise ValueError(f"无效IRF配置条目: {config}") from e
+                raise ValueError(f"Invalid IRF config entry: {config}") from e
 
         final_config = {
             member_id: cast(IrfPortConfig, {"irf_port1": ports["irf-port1"], "irf_port2": ports["irf-port2"]})
@@ -1060,12 +1926,6 @@ class ComwareDriver(NetworkDriver):
     def _normalize_interface(self, interface: str) -> str:
         return interface.strip().replace(" ", "")
 
-    def is_irf(self):
-        """
-        Returns True if the IRF is setup.
-        """
+    def is_irf(self) -> bool:
         config = self.get_irf_config()
-        if config:
-            return {"is_irf": True}
-        else:
-            return {"is_irf": False}
+        return bool(config)

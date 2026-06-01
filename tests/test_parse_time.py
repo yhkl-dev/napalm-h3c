@@ -1,5 +1,8 @@
+import time
+
 import pytest
 
+from napalm_h3c_comware.utils import helpers
 from napalm_h3c_comware.utils.helpers import (
     DAY_SECONDS,
     HOUR_SECONDS,
@@ -8,6 +11,7 @@ from napalm_h3c_comware.utils.helpers import (
     YEAR_SECONDS,
     _search,
     parse_time,
+    strptime,
 )
 
 
@@ -41,7 +45,6 @@ class TestTimeParser:
         ],
     )
     def test_valid_time_strings(self, time_str: str, expected_seconds: int):
-        print(parse_time(time_str))
         assert parse_time(time_str) == expected_seconds
 
     def test_empty_string(self):
@@ -49,3 +52,18 @@ class TestTimeParser:
 
     def test_whitespace_string(self):
         assert parse_time("   ") == 0
+
+    def test_strptime_uses_local_time_conversion(self, monkeypatch):
+        expected_time_array = time.strptime("2024-01-02 03:04:05", "%Y-%m-%d %H:%M:%S")
+        calls = {"value": None}
+
+        monkeypatch.setattr(helpers.time, "strptime", lambda *_args, **_kwargs: expected_time_array)
+
+        def fake_mktime(time_array):
+            calls["value"] = time_array
+            return 1704135845.0
+
+        monkeypatch.setattr(helpers.time, "mktime", fake_mktime)
+
+        assert strptime("2024-01-02 03:04:05") == 1704135845.0
+        assert calls["value"] == expected_time_array
