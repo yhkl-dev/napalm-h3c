@@ -121,6 +121,7 @@ class TestConfigWorkflow:
             device.commit_config(revert_in=300)
 
     def test_rollback_from_merge_backup(self, device):
+        device.device = MagicMock()
         calls = []
 
         def side_effect(cmd):
@@ -138,6 +139,7 @@ class TestConfigWorkflow:
         assert calls[-1] == "save force"
 
     def test_rollback_fallback_to_replace_backup(self, device):
+        device.device = MagicMock()
         calls = []
 
         def side_effect(cmd):
@@ -155,6 +157,7 @@ class TestConfigWorkflow:
         assert calls[-1] == "save force"
 
     def test_rollback_prefers_most_recent_backup(self, device):
+        device.device = MagicMock()
         device._last_backup_file = "backup-before-replace.cfg"
         calls = []
 
@@ -175,6 +178,7 @@ class TestConfigWorkflow:
         assert "rollback configuration to file backup-before-merge.cfg" not in calls
 
     def test_rollback_prefers_newest_backup_from_directory_listing(self, device):
+        device.device = MagicMock()
         calls = []
 
         def side_effect(cmd):
@@ -198,6 +202,7 @@ class TestConfigWorkflow:
         assert "rollback configuration to file backup-before-merge.cfg" not in calls
 
     def test_rollback_falls_back_to_legacy_replace_command(self, device):
+        device.device = MagicMock()
         calls = []
 
         def side_effect(cmd):
@@ -220,6 +225,7 @@ class TestConfigWorkflow:
         assert calls[-1] == "save force"
 
     def test_rollback_treats_cli_error_text_as_failure(self, device):
+        device.device = MagicMock()
         calls = []
 
         def side_effect(cmd):
@@ -243,6 +249,7 @@ class TestConfigWorkflow:
         ]
 
     def test_rollback_fails_when_no_backup(self, device):
+        device.device = MagicMock()
         device.send_command = MagicMock(side_effect=Exception("not found"))
         with pytest.raises(Exception, match="no backup config found"):
             device.rollback()
