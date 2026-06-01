@@ -7,7 +7,7 @@ authors = [
 ]
 license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.9,<4.0"
+requires-python = ">=3.9,<3.13"
 dependencies = [
     "napalm==5.0.0"
 ]
@@ -19,9 +19,6 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry]
 packages = [
     { include = "napalm_h3c_comware" }
-]
-include = [
-    { path = "telnetlib.py", format = ["sdist", "wheel"] }
 ]
 
 [[tool.poetry.source]]
@@ -53,10 +50,6 @@ warn_unused_configs = true
 [[tool.mypy.overrides]]
 module = ["napalm.*", "netmiko.*", "netaddr.*"]
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["napalm_h3c_comware._compat.telnetlib"]
-ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -23,4 +23,4 @@ jobs:
       - run: poetry install --no-interaction
 
       - run: poetry run mypy napalm_h3c_comware/comware.py napalm_h3c_comware/types.py
-      - run: poetry run pytest -q tests/test_parse_time.py tests/test_comware_additions.py tests/test_telnetlib_shim.py tests/test_get_interfaces_ip.py tests/test_display_memory.py tests/test_lldp_parser.py
+      - run: poetry run pytest -q tests/test_parse_time.py tests/test_comware_additions.py tests/test_get_interfaces_ip.py tests/test_display_memory.py tests/test_lldp_parser.py
