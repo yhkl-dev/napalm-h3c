@@ -1,6 +1,5 @@
 import re
 import time
-from typing import Any, Callable, List, Optional, TypeVar
 
 from napalm.base.helpers import canonical_interface_name
 
@@ -81,25 +80,7 @@ def parse_time(time_str: str) -> int:
     )
 
 
-def parse_null(value: Any, default: Any, func: Optional[Callable[..., Any]] = None, *args: Any, **kwargs: Any) -> Any:
-    if value == "":
-        return default
-    if func:
-        return func(value, *args, **kwargs)
-    return value
-
-
 def strptime(time_str: str) -> float:
     time_array = time.strptime(time_str, "%Y-%m-%d %H:%M:%S")
     timestamp = time.mktime(time_array)
     return float(timestamp)
-
-
-T = TypeVar("T")
-
-
-def get_value_from_list_of_dict(_list: List[dict], dict_key: str, func_max_or_min: Callable[..., T]) -> dict:
-    all_item = []
-    for _dict in _list:
-        all_item.append(_dict.get(dict_key))
-    return _list[all_item.index(func_max_or_min(all_item))]

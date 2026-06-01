@@ -478,18 +478,37 @@ class TestOperationalParsers:
             device.traceroute("8.8.8.8", timeout="2\ndisplay version")  # type: ignore[arg-type]
 
     def test_get_mac_address_table_uses_normalized_move_keys(self, device):
-        device._get_structured_output.side_effect = [
-            [{"mac_address": "0012-3456-789a", "vlan": "10", "state": "dynamic", "interface": "GigabitEthernet1/0/1"}],
-            [
-                {
-                    "mac_address": "0012-3456-789a",
-                    "vlan": "10",
-                    "current_port": "GigabitEthernet1/0/1",
-                    "source_port": "GigabitEthernet1/0/2",
-                    "last_move": "2024-01-02 03:04:05",
-                    "times": "7",
-                }
-            ],
+        device._get_structured_output.return_value = [
+            {"mac_address": "0012-3456-789a", "vlan": "10", "state": "dynamic", "interface": "GigabitEthernet1/0/1"},
+        ]
+        move_table = [
+            {
+                "mac": "00:12:34:56:78:9A",
+                "vlan": 10,
+                "current_port": "GigabitEthernet1/0/1",
+                "source_port": "GigabitEthernet1/0/2",
+                "last_move": "2024-01-02 03:04:05",
+                "moves": 7,
+            }
+        ]
+
+        result = device.get_mac_address_table(move_table=move_table)
+
+        assert result == [
+            {
+                "mac": "00:12:34:56:78:9A",
+                "interface": "GigabitEthernet1/0/1",
+                "vlan": 10,
+                "static": False,
+                "active": True,
+                "last_move": strptime("2024-01-02 03:04:05"),
+                "moves": 7,
+            }
+        ]
+
+    def test_get_mac_address_table_without_move_data(self, device):
+        device._get_structured_output.return_value = [
+            {"mac_address": "0012-3456-789a", "vlan": "10", "state": "dynamic", "interface": "GigabitEthernet1/0/1"},
         ]
 
         result = device.get_mac_address_table()
@@ -501,8 +520,8 @@ class TestOperationalParsers:
                 "vlan": 10,
                 "static": False,
                 "active": True,
-                "last_move": strptime("2024-01-02 03:04:05"),
-                "moves": 7,
+                "last_move": -1.0,
+                "moves": -1,
             }
         ]
 

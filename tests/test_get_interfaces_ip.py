@@ -1,4 +1,5 @@
 import pytest
+from napalm.base.exceptions import CommandErrorException
 
 
 class TestGetInterfacesIP:
@@ -46,7 +47,7 @@ class TestGetInterfacesIP:
     def test_command_execution_failure(self, device):
         """Test behavior when command execution fails"""
         device._get_structured_output.side_effect = Exception("Command failed")
-        with pytest.raises(RuntimeError, match="Failed to execute 'display ip interface'"):
+        with pytest.raises(CommandErrorException, match="Failed to execute 'display ip interface'"):
             device.get_interfaces_ip()
 
     def test_return_type(self, device):
